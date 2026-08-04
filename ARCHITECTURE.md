@@ -250,28 +250,48 @@ Spreadsheet `1C1k-ZMmizDFf357fAQvKdKgjmgaP8V_zmGrie-KR0vI`, four tabs
   `refreshHolidaysFromSage()` (see §8's Sage section) — treat it as a cache,
   not a hand-edited source, since the next weekly refresh overwrites it
   entirely.
+- **`ArchivedBookings`** — same columns as `Bookings`. Rows older than the
+  current week get moved here (see below) — treat it as a permanent archive,
+  not a working sheet; nothing in the app reads from it.
 
 Sheet values are sanitized on write (`sanitizeSheetValue`) to stop formula
 injection (a name starting with `=+-@` gets a leading `'` so Sheets doesn't
 evaluate it) — applied to `Bookings` only (names typed by a signed-in Google
-user); `SageEvents` doesn't need it since its content comes from a trusted
-internal HR feed, not free-text user input.
+user); `SageEvents`/`ArchivedBookings` don't need it (Sage's feed and
+already-sanitized archived rows respectively, not free-text user input).
 
-**`Bookings` has no retention limit or archiving — this is a known,
-currently-unaddressed growth problem.** Every read of it (`getBookingsForRange`,
-`getMonthSummary`, `bookDesk`'s own-booking check, `assignDeskForSlot`, etc.)
-calls `sheet.getDataRange().getValues()`, which reads *every row ever
-written*, then filters to the relevant date range in memory — there's no
-partial/indexed read, because Sheets doesn't support one without the rows
-already being sorted by date (they're in append order, not date order, since
-`bookMyWeek`/admin actions/etc. can append a booking for any date at any
-time). This means every operation's cost scales with the sheet's total
-row count, not with how much data is actually relevant, and it will keep
-getting slower as historical bookings accumulate with no ceiling. Fixing this
-properly needs a retention/archiving decision (how far back to keep live,
-archive vs. delete outright) that hasn't been made as of 2026-08-04 — not
-implemented here without that decision, since it means permanently moving or
-removing real booking history.
+**`Bookings` is kept to the current week onward — `archiveOldBookings()`
+moves anything older into `ArchivedBookings` on a daily trigger.** Every
+read of `Bookings` (`getBookingsForRange`, `getMonthSummary`, `bookDesk`'s
+own-booking check, `assignDeskForSlot`, etc.) does `getDataRange().getValues()`
+— a full-sheet read with in-memory filtering, since Sheets has no
+partial/indexed read without rows being sorted by date (they're in append
+order, not date order). Left unbounded this only gets slower over time; by
+explicit choice, the live sheet only needs to stay accurate for the current
+week onward, so:
+
+- The cutoff is **"before the start of the current week,"** recomputed
+  fresh on every run (not a fixed day-count) — it rolls forward
+  automatically and never needs updating by hand.
+- **Trade-off accepted deliberately**: week-back navigation and days
+  earlier in the month-summary view will show as empty once their week is
+  archived (data isn't lost, just no longer read by the live app — visible
+  in `ArchivedBookings` if ever needed by hand), and cancelling a booking
+  from before the current week will stop finding it. Nothing was added to
+  merge the two sheets on read, since that would reintroduce most of the
+  cost this exists to avoid.
+- Implementation does one read + up to two batch writes (kept rows
+  rewritten in place, stale tail removed via `deleteRows`, old rows
+  batch-appended to `ArchivedBookings`) rather than deleting matched rows
+  one at a time — `deleteRow` in a loop re-shifts every row below it on
+  each call, which is fine for a handful of rows but degrades badly on a
+  large one-time backlog. Note it's `deleteRows`, not `clearContent` — a
+  cleared-but-not-deleted row still counts toward `getLastRow()`/
+  `getDataRange()`, so every future read would iterate it and call
+  `parseRowDate('')` on it, which throws (`Utilities.formatDate` on an
+  Invalid Date) — this was caught in testing before ever being deployed.
+- One-time setup: run `installBookingsArchiveTrigger()` once from the Apps
+  Script editor (installs a daily 2am trigger). Safe to re-run.
 
 ### Caching
 
@@ -471,6 +491,8 @@ merge → deploy → verify.
 - **Force a Sage refresh outside the weekly schedule:** run `refreshHolidaysFromSage()` once from the Apps Script editor's function dropdown.
 - **Change the Sage mirror window** (default: today −7 to +30 days): edit the two `setDate` offsets in `refreshHolidaysFromSage()`.
 - **First-time setup after any fresh deploy** (or if load times regress back to "slow after being idle"): run `installCacheWarmingTrigger()` once from the Apps Script editor — installs the 5-minute cache-warming schedule. Safe to re-run.
+- **First-time setup for bookings archiving**: run `installBookingsArchiveTrigger()` once — installs the daily archive-old-bookings schedule. Safe to re-run.
+- **Look up a booking from before the current week**: check the `ArchivedBookings` tab directly — the app itself doesn't read it.
 - **Cache warming interval:** `.everyMinutes(5)` in `installCacheWarmingTrigger()` — valid values are 1, 5, 10, 15, or 30 (Apps Script restriction). Change it, then re-run the function once to apply (it clears the old trigger first).
 - **Sage feed URL changed** (e.g. regenerated in Sage HR settings): update the `SAGE_ICS_URL` Script Property (Project Settings > Script Properties) — no code change or redeploy needed, since `getSageIcsUrl()` reads it at call time.
 - **Change desk count:** `TOTAL_CORE_DESKS` const in `code.gs`.

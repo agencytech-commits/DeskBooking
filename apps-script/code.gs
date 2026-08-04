@@ -292,6 +292,7 @@ function getSheet(name) {
     if (name === 'DayNotes') sheet.appendRow(['Date', 'Note', 'UpdatedAt', 'UpdatedBy']);
     if (name === 'Admins') sheet.appendRow(['Email']);
     if (name === 'SageEvents') sheet.appendRow(['Name', 'Kind', 'Start', 'End']);
+    if (name === 'ArchivedBookings') sheet.appendRow(['Date', 'Desk', 'Name', 'Email', 'BookedAt', 'Slot', 'Dog']);
   }
   return sheet;
 }
@@ -1115,6 +1116,74 @@ function installCacheWarmingTrigger() {
   ScriptApp.newTrigger('warmSharedCaches')
     .timeBased()
     .everyMinutes(5)
+    .create();
+}
+
+// ============================================================
+// BOOKINGS ARCHIVING
+// ------------------------------------------------------------
+// Every read of Bookings (getBookingsForRange, getMonthSummary, bookDesk's
+// own-booking check, assignDeskForSlot, ...) scans the *whole* sheet, then
+// filters to the relevant dates in memory — there's no partial/indexed read,
+// since rows are in append order, not date order. Left unbounded, the sheet
+// only ever grows and every read gets slower over time with no ceiling.
+//
+// By explicit choice, the live sheet only needs to cover the current week
+// onward: week-back navigation and days earlier in the month-summary view
+// will show as empty once their week is archived (they're not lost, just no
+// longer read by the live app — recoverable by hand from ArchivedBookings if
+// ever needed), and cancelling a booking from before the current week will
+// stop finding it. The cutoff is "before the start of the current week",
+// recomputed fresh on every run rather than a fixed day-count, so it rolls
+// forward automatically and never needs updating by hand.
+// ============================================================
+
+function archiveOldBookings() {
+  const now = new Date();
+  const day = now.getDay();
+  const monday = new Date(now.getFullYear(), now.getMonth(), now.getDate() + (day === 0 ? -6 : 1 - day));
+  const cutoffStr = Utilities.formatDate(monday, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+
+  const sheet = getSheet('Bookings');
+  const allData = sheet.getDataRange().getValues();
+  if (allData.length <= 1) return; // just the header, nothing to do
+
+  const header = allData[0];
+  const toArchive = [];
+  const toKeep = [];
+  for (let i = 1; i < allData.length; i++) {
+    (parseRowDate(allData[i][0]) < cutoffStr ? toArchive : toKeep).push(allData[i]);
+  }
+  if (!toArchive.length) return; // nothing old enough yet
+
+  const archiveSheet = getSheet('ArchivedBookings');
+  archiveSheet.getRange(archiveSheet.getLastRow() + 1, 1, toArchive.length, toArchive[0].length).setValues(toArchive);
+
+  // Rewrite Bookings with only the kept rows in one pass, then remove the
+  // now-stale tail left over from the sheet's previous (longer) length.
+  // This must be deleteRows, not clearContent — a cleared-but-not-deleted
+  // row still counts toward getLastRow()/getDataRange(), so every future
+  // read would iterate it and call parseRowDate('') on it, which throws
+  // (Utilities.formatDate on an Invalid Date). Rewriting in one batch
+  // rather than deleting each old row individually also avoids the
+  // per-call row-reshift cost that makes deleteRow slow on a large
+  // one-time backlog.
+  const lastRow = sheet.getLastRow();
+  if (toKeep.length) sheet.getRange(2, 1, toKeep.length, header.length).setValues(toKeep);
+  const staleTailStart = toKeep.length + 2;
+  if (staleTailStart <= lastRow) sheet.deleteRows(staleTailStart, lastRow - staleTailStart + 1);
+}
+
+// One-time setup — run this once from the Apps Script editor. Safe to
+// re-run: removes any existing trigger for this function first.
+function installBookingsArchiveTrigger() {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'archiveOldBookings') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('archiveOldBookings')
+    .timeBased()
+    .everyDays(1)
+    .atHour(2)
     .create();
 }
 

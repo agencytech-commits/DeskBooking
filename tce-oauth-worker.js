@@ -113,8 +113,11 @@ export default {
         return Response.redirect('https://deskbooking.agencytech.workers.dev/signin.html', 302);
       }
 
-      // Redirect to Pages-hosted index.html (avoids same-zone subrequest restriction)
-      return Response.redirect('https://deskbooking.agencytech.workers.dev/index.html', 302);
+      // Redirect to the asset-hosted app page. Not named index.html: Cloudflare's
+      // asset server treats that filename as the implicit document for "/" and
+      // won't serve it at its own path, which since "/" is worker-first meant
+      // /app -> /index.html -> / -> signin -> /app looped forever.
+      return Response.redirect('https://deskbooking.agencytech.workers.dev/app.html', 302);
     }
 
     // ── API PROXY ───────────────────────────────────────────

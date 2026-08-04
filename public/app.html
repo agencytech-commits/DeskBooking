@@ -602,11 +602,18 @@ function renderHolidays() {
       .filter(x => x.end >= todayS)
       .sort((a,b) => a.end < b.end ? -1 : a.end > b.end ? 1 : 0);
   }
+  // Birthdays/anniversaries show for the whole current week even after the
+  // day's passed (the backend already scopes both to Mon–Fri, so this can't
+  // leak into other weeks) — unlike "away", where someone already back
+  // shouldn't still show as away.
+  function sortedWeek(list) {
+    return (list || []).slice().sort((a,b) => a.end < b.end ? -1 : a.end > b.end ? 1 : 0);
+  }
 
   const sections = [
     { key: 'away', title: 'Away this week', empty: 'No one away this week', items: upcoming(holidaysCache), label: awayLabel },
-    { key: 'birthdays', title: '🎂 Birthdays this week', empty: 'No birthdays this week', items: upcoming(birthdaysCache), label: b => dayLabel(b.end) },
-    { key: 'anniversaries', title: '🎉 Work anniversaries this week', empty: 'No anniversaries this week', items: upcoming(anniversariesCache), label: a => dayLabel(a.end) }
+    { key: 'birthdays', title: '🎂 Birthdays this week', empty: 'No birthdays this week', items: sortedWeek(birthdaysCache), label: b => dayLabel(b.end) },
+    { key: 'anniversaries', title: '🎉 Work anniversaries this week', empty: 'No anniversaries this week', items: sortedWeek(anniversariesCache), label: a => dayLabel(a.end) }
   ];
 
   const collapsedMap = getCollapsedSections();

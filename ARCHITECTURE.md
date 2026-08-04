@@ -221,7 +221,7 @@ the user, not as itself.
 
 ### Actions (dispatch table)
 
-GET (`doGet`): `getAll`, `getGlassBox`, `getMonthSummary`.
+GET (`doGet`): `getAll`, `getGlassBox`, `getMonthSummary`, `getHolidays`.
 POST (`doPost`): `bookDesk`, `toggleDog`, `cancelDesk`, `adminCancelDesk`,
 `bookMyWeek`, `cancelMyWeek`, `bookGlassBox`, `cancelGlassBox`, `searchPeople`.
 
@@ -277,7 +277,22 @@ then separately fires `getGlassBox` to fill in the Glass Box grid. If the
 second call fails, it fails **silently** (`loadGlassBox()` just returns on
 error, no console output) — so an Apps Script hiccup on that specific call
 looks identical to "nobody's booked the Glass Box this week," not an error.
-Reloading (or switching weeks and back) retries it.
+Reloading (or switching weeks and back) retries it. `getHolidays` (see below)
+has the same silent-failure behavior.
+
+On first page load only, the loader stays up until `refresh()` (desks +
+Glass Box), `loadMonthSummary()`, and `loadHolidays()` have all resolved
+(`Promise.all`, with a 12s safety backstop that reveals the page regardless
+so a hung call can't trap the user) — this avoids widgets popping in one by
+one after the loader animation ends. Subsequent week navigation doesn't wait
+on Glass Box the same way; it renders cached/desk data immediately and lets
+Glass Box fill in a moment later.
+
+The header's "Away this week" widget calls `getHolidays` (no params), which
+returns `{ success, holidays: [{ name, start, end }] }` from
+`getHolidaysThisWeek()` — everyone away this week, not scoped to the
+currently-viewed week. The frontend filters to `end >= today` and sorts by
+end date (soonest-back first); it only reads `name` and `end` from each entry.
 
 ## 9. Notable gotchas found while deploying (2026-08-04)
 
@@ -380,4 +395,5 @@ project / domain / spreadsheet" scan:
 | Spreadsheet ID | `code.gs` (`SHEET_ID`) |
 | Glass Box resource calendar ID | `code.gs` (`GLASS_BOX_CALENDAR`) |
 | Social calendar ID | `code.gs` (`SOCIAL_CALENDAR_ID`) |
+| Holidays calendar ID | `code.gs` (`HOLIDAYS_CALENDAR_ID`) |
 | `deskbooking`/`tce-oauth` hostnames | scattered across `tce-oauth-worker.js`, `signin.html`, `app.html` — see §5's table for exactly which path uses which |

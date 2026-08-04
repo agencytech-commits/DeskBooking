@@ -70,6 +70,11 @@
   .user-email { font-size: 11px; color: var(--text-muted); }
   .signout-btn { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-faint); background: none; border: none; cursor: pointer; margin-left: 8px; transition: color 120ms; }
   .signout-btn:hover { color: var(--clementine); }
+  .holidays-widget { width: 100%; margin-top: 10px; border: 2px solid var(--ink); background: var(--surface); padding: 8px 12px; }
+  .holidays-title { font-family: var(--font-display); font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); margin-bottom: 4px; }
+  .holiday-item { display: flex; align-items: baseline; gap: 6px; padding: 2px 0; font-size: 12px; }
+  .holiday-name { font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .holiday-until { color: var(--text-muted); font-weight: 500; white-space: nowrap; }
   .week-nav { display: flex; align-items: center; gap: 12px; margin-bottom: 22px; }
   .week-nav button:not(.today-btn):not(.bulk-btn) { width: 38px; height: 38px; border: 2px solid var(--ink); background: var(--surface); cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 20px; font-weight: 700; transition: background 120ms; }
   .week-nav button:not(.today-btn):not(.bulk-btn):hover { background: var(--flamingo); }
@@ -401,6 +406,7 @@
         </div>
         <button class="signout-btn" onclick="signOut()">Sign out</button>
       </div>
+      <div class="holidays-widget" id="holidaysWidget"></div>
     </div>
   </div>
   <div class="week-nav">
@@ -451,6 +457,8 @@ function escapeHtml(s) { return String(s==null?'':s).replace(/[&<>"']/g, c => ({
 
 // ── HEADER DATE/TIME ───────────────────────────────────────────
 const DAY_NAMES = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+const DAY_SHORT = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+function ordinal(n) { const s=['th','st','nd','rd'], v=n%100; return n+(s[(v-20)%10]||s[v]||s[0]); }
 function renderHeaderDateTime() {
   const now = new Date();
   document.getElementById('headerDate').textContent = `${DAY_NAMES[now.getDay()]} ${now.getDate()} ${MONTHS[now.getMonth()]}`;
@@ -529,6 +537,35 @@ function renderMonthCalendar() {
     cells += `<span class="${cellCls.join(' ')}" onclick="goToMonthDay('${dateStr(d)}')"><span class="${dotCls.join(' ')}">${day}</span></span>`;
   }
   document.getElementById('monthCalGrid').innerHTML = cells;
+}
+
+// ── HOLIDAYS (who's off this week) ────────────────────────────
+let holidaysCache = null;
+
+async function loadHolidays() {
+  const result = await api({ action: 'getHolidays' });
+  if (!result || result.error) return;
+  holidaysCache = result.holidays || [];
+  renderHolidays();
+}
+
+function renderHolidays() {
+  const container = document.getElementById('holidaysWidget');
+  if (!container) return;
+  const todayS = dateStr(new Date());
+  const items = (holidaysCache || [])
+    .filter(h => h.end >= todayS)
+    .sort((a,b) => a.end < b.end ? -1 : a.end > b.end ? 1 : 0);
+
+  if (!items.length) { container.innerHTML = ''; return; }
+
+  container.innerHTML = '<div class="holidays-title">Away this week</div>' + items.map(h => {
+    const endD = new Date(h.end + 'T00:00:00');
+    const label = h.end === todayS
+      ? 'away today'
+      : `away til ${DAY_SHORT[endD.getDay()]} ${ordinal(endD.getDate())}`;
+    return `<div class="holiday-item"><span class="holiday-name">${escapeHtml(h.name)}</span><span class="holiday-until">(${label})</span></div>`;
+  }).join('');
 }
 
 // ── NAV ──────────────────────────────────────────────────────
@@ -1141,6 +1178,7 @@ function hideAppLoader() {
 }
 
 loadMonthSummary();
+loadHolidays();
 refresh().finally(hideAppLoader);
 setTimeout(hideAppLoader, 12000);        // safety backstop — never trap the user
 // Reveal the live-calendar embed even if its onload never fires.

@@ -313,14 +313,6 @@ function renderHeaderNotices(ws) {
 // ── MONTH CALENDAR ───────────────────────────────────────────
 let monthCache = null; // { year, month, days: { 'yyyy-MM-dd': {mine:'core'|'overflow'|null, full:bool} } }
 
-async function loadMonthSummary() {
-  const now = new Date();
-  const monthStart = dateStr(new Date(now.getFullYear(), now.getMonth(), 1));
-  const result = await api({action:'getMonthSummary', monthStart});
-  if (!result || result.error) return;
-  monthCache = { year: now.getFullYear(), month: now.getMonth(), days: result.days || {} };
-  renderMonthCalendar();
-}
 
 function renderMonthCalendar() {
   if (!monthCache) return;

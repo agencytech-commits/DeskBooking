@@ -176,12 +176,17 @@ export default {
           if (!result.ok) return withCookie(jsonResponse({ error: result.error }, 502));
 
           const body = JSON.stringify(result.data);
-          // Cache the raw response body (not the parsed object) so the hit
-          // path above can hand it straight back with no re-serialization.
-          // waitUntil so populating the cache never delays this response.
-          ctx.waitUntil(cache.put(cacheKey, new Response(body, {
-            headers: { 'Content-Type': 'application/json', 'Cache-Control': `public, max-age=${SHARED_CACHE_TTL_SECONDS}` }
-          })));
+          // result.ok only means "we got JSON back" — code.gs's own error
+          // replies (unknown action, a thrown exception) are ALSO valid JSON
+          // ({"error": "..."}), so that alone isn't enough to cache on. Only
+          // cache genuine successes, or a stale "Unknown action" / exception
+          // response would get served to everyone else for the next 60s too.
+          if (result.data && result.data.success && !result.data.error) {
+            // waitUntil so populating the cache never delays this response.
+            ctx.waitUntil(cache.put(cacheKey, new Response(body, {
+              headers: { 'Content-Type': 'application/json', 'Cache-Control': `public, max-age=${SHARED_CACHE_TTL_SECONDS}` }
+            })));
+          }
           return withCookie(new Response(body, { headers: { 'Content-Type': 'application/json', ...CORS_HEADERS } }));
         }
 

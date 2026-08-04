@@ -648,16 +648,17 @@ async function revalidateWeek(ws) {
   }
 }
 
-async function loadAll() {
+async function loadAll(awaitGlassBox) {
   const ws = dateStr(currentWeekStart);
   updateNavButtons();
 
   // If cached, render immediately — instant navigation — then quietly check for changes
   if (weekCache[ws]) {
     renderWeekFromCache(ws);
-    if (!glassCache[ws]) loadGlassBox(ws);
+    const glassPromise = glassCache[ws] ? null : loadGlassBox(ws);
     schedulePrefetch();
     revalidateWeek(ws);
+    if (awaitGlassBox && glassPromise) await glassPromise;
     return;
   }
 
@@ -680,9 +681,10 @@ async function loadAll() {
   cacheWeekResult(ws, result);
   renderWeekFromCache(ws);
 
-  // Deferred: load glass box separately
-  loadGlassBox(ws);
+  // Deferred: load glass box separately (except on first load — see refresh(awaitGlassBox))
+  const glassPromise = loadGlassBox(ws);
   schedulePrefetch();
+  if (awaitGlassBox) await glassPromise;
 }
 
 async function loadGlassBox(ws) {
@@ -1141,9 +1143,9 @@ function launchConfetti() {
 }
 
 // ── INIT ──────────────────────────────────────────────────────
-async function refresh() {
+async function refresh(awaitGlassBox) {
   updateNavButtons();
-  await loadAll();
+  await loadAll(awaitGlassBox);
 }
 
 async function goToMonthDay(ds) {
@@ -1177,9 +1179,13 @@ function hideAppLoader() {
   setTimeout(() => el.classList.add("is-hidden"), wait);
 }
 
-loadMonthSummary();
-loadHolidays();
-refresh().finally(hideAppLoader);
+// First load only: wait for desks, Glass Box, month calendar AND holidays to all be
+// ready before revealing the page, so nothing pops in after the loader animation ends.
+Promise.all([
+  refresh(true),
+  loadMonthSummary(),
+  loadHolidays()
+]).finally(hideAppLoader);
 setTimeout(hideAppLoader, 12000);        // safety backstop — never trap the user
 // Reveal the live-calendar embed even if its onload never fires.
 setTimeout(function(){ var s=document.getElementById('glassEmbedSkeleton'); if(s) s.remove(); }, 8000);

@@ -1,0 +1,4 @@
+name = "tce-oauth"
+main = "tce-oauth-worker.js"
+compatibility_date = "2025-09-01"
+workers_dev = true

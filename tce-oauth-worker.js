@@ -4,7 +4,8 @@
 // ============================================================
 
 const CLIENT_ID = '922633372763-rhftau15jc4loepphatc2fl51r5unhkf.apps.googleusercontent.com';
-const CLIENT_SECRET = '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';
+// GOOGLE_CLIENT_SECRET and SESSION_SECRET are Worker secrets (wrangler secret put),
+// not hardcoded here — this file used to ship the OAuth client secret in plaintext.
 const CALLBACK_URI = 'https://tce-oauth.agencytech.workers.dev/callback';
 const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyhp7Uf5V4K7q88FheCAizMosGejrnVPVdsI8O9nZJMIf4pbfBaifk7QcSATbCJJo-r/exec';
 const DOMAIN = 'thecontentemporium.co.uk';
@@ -21,15 +22,40 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Headers': 'Content-Type'
 };
 
-// Session stored in cookie as base64 JSON — no server memory needed
-function encodeSession(data) {
-  return btoa(unescape(encodeURIComponent(JSON.stringify(data))));
+// Session stored in cookie as base64 JSON, HMAC-signed so a client can't forge
+// or edit one (e.g. set someone else's @domain email) without SESSION_SECRET.
+// crypto.subtle.verify does a constant-time comparison internally.
+async function getSigningKey(env) {
+  if (!env.SESSION_SECRET) throw new Error('SESSION_SECRET not configured');
+  return crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(env.SESSION_SECRET),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign', 'verify']
+  );
 }
 
-function decodeSession(str) {
+async function encodeSession(data, env) {
+  const payload = btoa(unescape(encodeURIComponent(JSON.stringify(data))));
+  const key = await getSigningKey(env);
+  const sigBuf = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(payload));
+  const sig = btoa(String.fromCharCode(...new Uint8Array(sigBuf)));
+  return `${payload}.${sig}`;
+}
+
+async function decodeSession(cookie, env) {
+  const dot = cookie.lastIndexOf('.');
+  if (dot === -1) return null;
+  const payload = cookie.slice(0, dot);
+  const sig = cookie.slice(dot + 1);
   try {
-    return JSON.parse(decodeURIComponent(escape(atob(str))));
-  } catch(e) {
+    const key = await getSigningKey(env);
+    const sigBytes = Uint8Array.from(atob(sig), c => c.charCodeAt(0));
+    const valid = await crypto.subtle.verify('HMAC', key, sigBytes, new TextEncoder().encode(payload));
+    if (!valid) return null;
+    return JSON.parse(decodeURIComponent(escape(atob(payload))));
+  } catch (e) {
     return null;
   }
 }
@@ -58,7 +84,7 @@ export default {
           body: new URLSearchParams({
             code,
             client_id: CLIENT_ID,
-            client_secret: CLIENT_SECRET,
+            client_secret: env.GOOGLE_CLIENT_SECRET,
             redirect_uri: CALLBACK_URI,
             grant_type: 'authorization_code'
           })
@@ -88,7 +114,7 @@ export default {
           picture: userInfo.picture || ''
         };
 
-        const sessionCookie = encodeSession(sessionData);
+        const sessionCookie = await encodeSession(sessionData, env);
 
         // Set session cookie and redirect to app
         return new Response(null, {
@@ -222,7 +248,7 @@ function getSessionCookie(request) {
 
 async function getSession(sessionCookie, env) {
   if (!sessionCookie) return null;
-  return decodeSession(sessionCookie);
+  return decodeSession(sessionCookie, env);
 }
 
 async function maybeRefreshToken(session, sessionCookie, env) {
@@ -235,7 +261,7 @@ async function maybeRefreshToken(session, sessionCookie, env) {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
         client_id: CLIENT_ID,
-        client_secret: CLIENT_SECRET,
+        client_secret: env.GOOGLE_CLIENT_SECRET,
         refresh_token: session.refresh_token,
         grant_type: 'refresh_token'
       })
@@ -245,7 +271,7 @@ async function maybeRefreshToken(session, sessionCookie, env) {
 
     session.access_token = refreshed.access_token;
     session.expires_at = Date.now() + (refreshed.expires_in * 1000);
-    const newCookie = encodeSession(session);
+    const newCookie = await encodeSession(session, env);
     return { session, newCookie };
   } catch(e) {
     return { session: null, newCookie: null };

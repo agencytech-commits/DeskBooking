@@ -95,8 +95,10 @@ function doGet(e) {
         return jsonResponse(getGlassBoxWeek(e.parameter.weekStart, user));
       case 'getMonthSummary':
         return jsonResponse(getMonthSummary(e.parameter.monthStart, user));
-      case 'getHolidays':
-        return jsonResponse({ success: true, holidays: getHolidaysThisWeek() });
+      case 'getHolidays': {
+        const cal = getHolidaysThisWeek();
+        return jsonResponse({ success: true, holidays: cal.holidays, birthdays: cal.birthdays, anniversaries: cal.anniversaries });
+      }
       default:
         return jsonResponse({ error: 'Unknown action: ' + action });
     }
@@ -869,9 +871,31 @@ function getSocialEvents(startDate, endDate) {
 // HOLIDAYS (staff absence calendar)
 // ============================================================
 
-// This week's (Mon–Fri) holiday events, cached 5 min — same pattern as
-// getSocialEvents. Uses the script's own Calendar access, not a per-user
-// token, since it's a shared read-only view for everyone.
+// The shared calendar mixes three kinds of events under one calendar ID:
+// actual absences, birthdays, and work anniversaries — distinguished only by
+// a keyword in the title (no separate calendar, no event color/type to key
+// off). classifyCalendarEvent buckets each event; cleanEventName strips the
+// keyword (and a leading possessive "'s") so e.g. "Jane Smith's Birthday"
+// displays as "Jane Smith" rather than repeating "Birthday" next to the
+// 🎂 section header that already says so.
+function classifyCalendarEvent(title) {
+  const t = String(title || '');
+  if (/\banniversary\b/i.test(t)) return 'anniversary';
+  if (/\bbirthday\b/i.test(t)) return 'birthday';
+  return 'holiday';
+}
+
+function cleanEventName(title, keyword) {
+  return String(title || '')
+    .replace(new RegExp("[’']s\\s*" + keyword + "\\b", 'i'), '')
+    .replace(new RegExp('\\b' + keyword + '\\b', 'i'), '')
+    .replace(/[-–—:]+$/, '')
+    .trim();
+}
+
+// This week's (Mon–Fri) events from the shared calendar, cached 5 min — same
+// pattern as getSocialEvents. Uses the script's own Calendar access, not a
+// per-user token, since it's a shared read-only view for everyone.
 function getHolidaysThisWeek() {
   const now = new Date();
   const day = now.getDay(); // 0=Sun..6=Sat
@@ -886,27 +910,37 @@ function getHolidaysThisWeek() {
   const rangeEnd = new Date(friday);
   rangeEnd.setDate(rangeEnd.getDate() + 1); // getEvents' end bound is exclusive
 
-  let people = [];
+  const holidays = [];
+  const birthdays = [];
+  const anniversaries = [];
   try {
     const cal = CalendarApp.getCalendarById(HOLIDAYS_CALENDAR_ID);
     const events = cal ? cal.getEvents(monday, rangeEnd) : [];
-    people = events.map(function (ev) {
+    events.forEach(function (ev) {
       const isAllDay = ev.isAllDayEvent();
       const start = isAllDay ? ev.getAllDayStartDate() : ev.getStartTime();
       let end = isAllDay ? ev.getAllDayEndDate() : ev.getEndTime();
       // All-day end dates from the Calendar service are exclusive (the day AFTER
       // the last day off) — pull back one day so "end" means their last day away.
       if (isAllDay) end = new Date(end.getFullYear(), end.getMonth(), end.getDate() - 1);
-      return {
-        name: ev.getTitle(),
+
+      const title = ev.getTitle();
+      const kind = classifyCalendarEvent(title);
+      const entry = {
+        name: kind === 'holiday' ? title : cleanEventName(title, kind),
         start: Utilities.formatDate(start, 'Europe/London', 'yyyy-MM-dd'),
         end: Utilities.formatDate(end, 'Europe/London', 'yyyy-MM-dd')
       };
+
+      if (kind === 'birthday') birthdays.push(entry);
+      else if (kind === 'anniversary') anniversaries.push(entry);
+      else holidays.push(entry);
     });
   } catch (e) {}
 
-  try { CACHE.put(cacheKey, JSON.stringify(people), 300); } catch (e) {}
-  return people;
+  const result = { holidays, birthdays, anniversaries };
+  try { CACHE.put(cacheKey, JSON.stringify(result), 300); } catch (e) {}
+  return result;
 }
 
 // ============================================================

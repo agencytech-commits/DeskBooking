@@ -71,7 +71,11 @@
   .signout-btn { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-faint); background: none; border: none; cursor: pointer; margin-left: 8px; transition: color 120ms; }
   .signout-btn:hover { color: var(--clementine); }
   .holidays-widget { width: 100%; margin-top: 10px; border: 2px solid var(--ink); background: var(--surface); padding: 8px 12px; }
-  .holidays-title { font-family: var(--font-display); font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); margin-bottom: 4px; }
+  .holidays-section + .holidays-section { margin-top: 8px; }
+  .holidays-title { font-family: var(--font-display); font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); margin-bottom: 4px; cursor: pointer; user-select: none; display: flex; align-items: center; gap: 5px; }
+  .holidays-chevron { display: inline-block; font-size: 8px; transition: transform 120ms; }
+  .holidays-title.collapsed .holidays-chevron { transform: rotate(-90deg); }
+  .holiday-items.collapsed { display: none; }
   .holiday-item { display: flex; align-items: baseline; gap: 6px; padding: 2px 0; font-size: 12px; }
   .holiday-name { font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .holiday-until { color: var(--text-muted); font-weight: 500; white-space: nowrap; }
@@ -539,13 +543,41 @@ function renderMonthCalendar() {
   document.getElementById('monthCalGrid').innerHTML = cells;
 }
 
-// ── HOLIDAYS (who's off this week) ────────────────────────────
+// ── HOLIDAYS / BIRTHDAYS / ANNIVERSARIES (this week) ────────────
+// All three come from one shared calendar, classified server-side by keyword
+// (see getHolidaysThisWeek/classifyCalendarEvent in code.gs).
 let holidaysCache = null;
+let birthdaysCache = null;
+let anniversariesCache = null;
+
+// Each section's collapsed/expanded state persists per-browser (not tied to
+// the Google account, so it won't follow someone to a different device) —
+// intentional trade-off to avoid a backend round-trip for a UI toggle.
+const SECTION_COLLAPSE_KEY = 'tce_section_collapsed';
+function getCollapsedSections() {
+  try { return JSON.parse(localStorage.getItem(SECTION_COLLAPSE_KEY)) || {}; }
+  catch (e) { return {}; }
+}
+function setSectionCollapsed(key, collapsed) {
+  const cur = getCollapsedSections();
+  cur[key] = collapsed;
+  try { localStorage.setItem(SECTION_COLLAPSE_KEY, JSON.stringify(cur)); } catch (e) {}
+}
+function toggleHolidaySection(key) {
+  const collapsed = !getCollapsedSections()[key];
+  setSectionCollapsed(key, collapsed);
+  const items = document.querySelector(`.holiday-items[data-section="${key}"]`);
+  const title = document.querySelector(`.holidays-title[data-section="${key}"]`);
+  if (items) items.classList.toggle('collapsed', collapsed);
+  if (title) title.classList.toggle('collapsed', collapsed);
+}
 
 async function loadHolidays() {
   const result = await api({ action: 'getHolidays' });
   if (!result || result.error) return;
   holidaysCache = result.holidays || [];
+  birthdaysCache = result.birthdays || [];
+  anniversariesCache = result.anniversaries || [];
   renderHolidays();
 }
 
@@ -553,22 +585,43 @@ function renderHolidays() {
   const container = document.getElementById('holidaysWidget');
   if (!container) return;
   const todayS = dateStr(new Date());
-  const items = (holidaysCache || [])
-    .filter(h => h.end >= todayS)
-    .sort((a,b) => a.end < b.end ? -1 : a.end > b.end ? 1 : 0);
 
-  if (!items.length) { container.innerHTML = ''; return; }
+  function dayLabel(dateS) {
+    if (dateS === todayS) return 'today';
+    const d = new Date(dateS + 'T00:00:00');
+    return `${DAY_SHORT[d.getDay()]} ${ordinal(d.getDate())}`;
+  }
+  function awayLabel(h) {
+    if (h.end === todayS) return 'away today';
+    if (h.start === todayS) return `away til ${dayLabel(h.end)}`;
+    return `away ${dayLabel(h.start)} til ${dayLabel(h.end)}`;
+  }
+  function upcoming(list) {
+    return (list || [])
+      .filter(x => x.end >= todayS)
+      .sort((a,b) => a.end < b.end ? -1 : a.end > b.end ? 1 : 0);
+  }
 
-  container.innerHTML = '<div class="holidays-title">Away this week</div>' + items.map(h => {
-    const startD = new Date(h.start + 'T00:00:00');
-    const endD = new Date(h.end + 'T00:00:00');
-    const endLabel = `${DAY_SHORT[endD.getDay()]} ${ordinal(endD.getDate())}`;
-    const label = h.end === todayS
-      ? 'away today'
-      : h.start === todayS
-        ? `away til ${endLabel}`
-        : `away ${DAY_SHORT[startD.getDay()]} ${ordinal(startD.getDate())} til ${endLabel}`;
-    return `<div class="holiday-item"><span class="holiday-name">${escapeHtml(h.name)}</span><span class="holiday-until">(${label})</span></div>`;
+  const sections = [
+    { key: 'away', title: 'Away this week', items: upcoming(holidaysCache), label: awayLabel },
+    { key: 'birthdays', title: '🎂 Birthdays this week', items: upcoming(birthdaysCache), label: b => dayLabel(b.end) },
+    { key: 'anniversaries', title: '🎉 Work anniversaries this week', items: upcoming(anniversariesCache), label: a => dayLabel(a.end) }
+  ].filter(s => s.items.length);
+
+  if (!sections.length) { container.innerHTML = ''; return; }
+
+  const collapsedMap = getCollapsedSections();
+  container.innerHTML = sections.map(s => {
+    const collapsed = !!collapsedMap[s.key];
+    const rows = s.items.map(item =>
+      `<div class="holiday-item"><span class="holiday-name">${escapeHtml(item.name)}</span><span class="holiday-until">(${s.label(item)})</span></div>`
+    ).join('');
+    return `<div class="holidays-section">
+      <div class="holidays-title${collapsed ? ' collapsed' : ''}" data-section="${s.key}" onclick="toggleHolidaySection('${s.key}')" role="button" tabindex="0">
+        <span class="holidays-chevron">▾</span>${s.title}
+      </div>
+      <div class="holiday-items${collapsed ? ' collapsed' : ''}" data-section="${s.key}">${rows}</div>
+    </div>`;
   }).join('');
 }
 

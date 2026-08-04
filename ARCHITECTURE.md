@@ -233,7 +233,7 @@ Calendar/People APIs).
 
 ### Data model — the Sheet
 
-Spreadsheet `1C1k-ZMmizDFf357fAQvKdKgjmgaP8V_zmGrie-KR0vI`, three tabs
+Spreadsheet `1C1k-ZMmizDFf357fAQvKdKgjmgaP8V_zmGrie-KR0vI`, four tabs
 (auto-created by `getSheet()` if missing):
 
 - **`Bookings`** — `Date, Desk, Name, Email, BookedAt, Slot, Dog`. One row per
@@ -246,10 +246,32 @@ Spreadsheet `1C1k-ZMmizDFf357fAQvKdKgjmgaP8V_zmGrie-KR0vI`, three tabs
 - **`Admins`** — `Email`. One column, one email per row. Presence in this list
   is the *only* authorization check for `adminCancelDesk` — no other admin
   action exists.
+- **`SageEvents`** — `Name, Kind, Start, End`. Rebuilt in full every run of
+  `refreshHolidaysFromSage()` (see §8's Sage section) — treat it as a cache,
+  not a hand-edited source, since the next weekly refresh overwrites it
+  entirely.
 
 Sheet values are sanitized on write (`sanitizeSheetValue`) to stop formula
 injection (a name starting with `=+-@` gets a leading `'` so Sheets doesn't
-evaluate it).
+evaluate it) — applied to `Bookings` only (names typed by a signed-in Google
+user); `SageEvents` doesn't need it since its content comes from a trusted
+internal HR feed, not free-text user input.
+
+**`Bookings` has no retention limit or archiving — this is a known,
+currently-unaddressed growth problem.** Every read of it (`getBookingsForRange`,
+`getMonthSummary`, `bookDesk`'s own-booking check, `assignDeskForSlot`, etc.)
+calls `sheet.getDataRange().getValues()`, which reads *every row ever
+written*, then filters to the relevant date range in memory — there's no
+partial/indexed read, because Sheets doesn't support one without the rows
+already being sorted by date (they're in append order, not date order, since
+`bookMyWeek`/admin actions/etc. can append a booking for any date at any
+time). This means every operation's cost scales with the sheet's total
+row count, not with how much data is actually relevant, and it will keep
+getting slower as historical bookings accumulate with no ceiling. Fixing this
+properly needs a retention/archiving decision (how far back to keep live,
+archive vs. delete outright) that hasn't been made as of 2026-08-04 — not
+implemented here without that decision, since it means permanently moving or
+removing real booking history.
 
 ### Caching
 
@@ -269,6 +291,25 @@ against:
 TTLs are a backstop, not the primary freshness mechanism — writes explicitly
 invalidate the relevant key so the *actor's own* change is visible immediately;
 other users may see a stale cache for up to the TTL.
+
+**This sharing only helps within the TTL window, not across idle periods.**
+`CacheService` caps out at 6 hours even if asked for longer, and every TTL
+above is far shorter than that (45s–600s) — so after the app sits unused for
+hours or days, all of these are guaranteed cold, and whoever loads it next
+pays the full cost in one request (multiple sheet reads + the Glass Box
+Calendar API + `getSocialEvents`'s slow `CalendarApp` call). `warmSharedCaches()`
+exists specifically to prevent this: a trigger re-populates the current
+week's `wk_`/`gb_`/`soc_`/`hol_` and the `admins` cache every 5 minutes (see
+§11 for the one-time setup step), so no one has to be "the first person of
+the day" who eats the cold-start cost. It deliberately only warms the
+*current* week, not the ±2-week window the frontend prefetches in the
+background — that prefetch is already non-blocking, so warming it wouldn't
+fix anything a user actually feels, and `getSocialEvents` is expensive enough
+that multiplying it by 5 weeks every 5 minutes isn't worth the added Apps
+Script execution quota for no felt benefit. `ms_` (month summary) is
+per-user and isn't warmed — proactively warming it for "whoever logs in
+next" isn't meaningful, though it's a single cheap sheet read on its own,
+not the multi-API bottleneck the others are.
 
 ### Frontend load sequence
 
@@ -334,9 +375,24 @@ RFC5545 line-unfolding), not a library — Apps Script has no built-in ICS
 parser. It only reads `DTSTART`/`DTEND`/`SUMMARY` per event; anything else in
 the feed (`DESCRIPTION`, `UID`, the `VTIMEZONE` block) is ignored.
 
+**`refreshHolidaysFromSage()` only mirrors a window into `SageEvents`, not
+the whole feed** — Sage's feed itself spans well over a year of past and
+future events, but `getHolidaysThisWeek()` never looks beyond the current
+Mon–Fri week, so storing all of it would only make the sheet (and every read
+of it) bigger for no benefit. The window is today −7 days to +30 days,
+hardcoded in `refreshHolidaysFromSage()` — generous enough that a missed
+weekly refresh (Sage down, quota, whatever) still leaves the current week's
+data in the sheet from a recent-enough prior run, rather than a tight
+this-week-only window that would go blank after a single missed refresh.
+
 All three lists are scoped to the current calendar week (Mon–Fri), not the
-currently-viewed booking week. The frontend filters each to `end >= today`
-and sorts by end date (soonest-ending first).
+currently-viewed booking week. "Away this week" filters to `end >= today`
+(no reason to show someone who's already back) and sorts by end date
+(soonest-ending first). Birthdays/anniversaries deliberately don't apply
+that filter — they show for the whole current week even after the day's
+passed, since the backend already scopes both to Mon–Fri so this can't leak
+into other weeks, and unlike "away," a birthday earlier in the week is still
+worth knowing about on Thursday.
 
 Each of the three sections in the widget is independently collapsible
 (click the section title). Collapsed/expanded state is saved to
@@ -413,6 +469,9 @@ merge → deploy → verify.
 
 - **Add/remove an admin:** edit the `Admins` sheet tab directly (one email per row).
 - **Force a Sage refresh outside the weekly schedule:** run `refreshHolidaysFromSage()` once from the Apps Script editor's function dropdown.
+- **Change the Sage mirror window** (default: today −7 to +30 days): edit the two `setDate` offsets in `refreshHolidaysFromSage()`.
+- **First-time setup after any fresh deploy** (or if load times regress back to "slow after being idle"): run `installCacheWarmingTrigger()` once from the Apps Script editor — installs the 5-minute cache-warming schedule. Safe to re-run.
+- **Cache warming interval:** `.everyMinutes(5)` in `installCacheWarmingTrigger()` — valid values are 1, 5, 10, 15, or 30 (Apps Script restriction). Change it, then re-run the function once to apply (it clears the old trigger first).
 - **Sage feed URL changed** (e.g. regenerated in Sage HR settings): update the `SAGE_ICS_URL` Script Property (Project Settings > Script Properties) — no code change or redeploy needed, since `getSageIcsUrl()` reads it at call time.
 - **Change desk count:** `TOTAL_CORE_DESKS` const in `code.gs`.
 - **Change office hours (Glass Box grid):** `OFFICE_START_HOUR`/`OFFICE_END_HOUR`

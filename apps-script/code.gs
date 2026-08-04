@@ -960,6 +960,20 @@ function refreshHolidaysFromSage() {
   const blocks = text.split('BEGIN:VEVENT').slice(1);
   const rows = [];
 
+  // Sage's own feed spans well over a year (past + future events); the app
+  // only ever looks at the current Mon-Fri week, so mirroring all of it just
+  // makes SageEvents — and every getHolidaysThisWeek() read of it — bigger
+  // for no benefit. Keeping a few weeks of slack on each side (rather than
+  // exactly this week) means a missed weekly refresh — Sage down, quota,
+  // whatever — doesn't immediately blank the widget; it just serves a
+  // slightly stale window until the next successful refresh.
+  const windowStart = new Date();
+  windowStart.setDate(windowStart.getDate() - 7);
+  const windowEnd = new Date();
+  windowEnd.setDate(windowEnd.getDate() + 30);
+  const windowStartStr = Utilities.formatDate(windowStart, 'Europe/London', 'yyyy-MM-dd');
+  const windowEndStr = Utilities.formatDate(windowEnd, 'Europe/London', 'yyyy-MM-dd');
+
   blocks.forEach(function (block) {
     const dtstartMatch = block.match(/DTSTART(;[^:\r\n]*)?:([^\r\n]+)/);
     const dtendMatch = block.match(/DTEND(;[^:\r\n]*)?:([^\r\n]+)/);
@@ -974,16 +988,15 @@ function refreshHolidaysFromSage() {
     // convention used everywhere else in this file.
     if (isAllDay) end = new Date(end.getFullYear(), end.getMonth(), end.getDate() - 1);
 
+    const startStr = Utilities.formatDate(start, 'Europe/London', 'yyyy-MM-dd');
+    const endStr = Utilities.formatDate(end, 'Europe/London', 'yyyy-MM-dd');
+    if (startStr > windowEndStr || endStr < windowStartStr) return; // outside the window we care about
+
     const summary = unescapeIcsText(summaryMatch[1].trim());
-    rows.push([
-      sageEventName(summary),
-      classifyCalendarEvent(summary),
-      Utilities.formatDate(start, 'Europe/London', 'yyyy-MM-dd'),
-      Utilities.formatDate(end, 'Europe/London', 'yyyy-MM-dd')
-    ]);
+    rows.push([sageEventName(summary), classifyCalendarEvent(summary), startStr, endStr]);
   });
 
-  if (!rows.length) return; // parsed nothing — likely a bad fetch, don't wipe good data
+  if (!rows.length) return; // parsed nothing (or nothing in-window) — don't wipe good data
 
   const sheet = getSheet('SageEvents');
   const lastRow = sheet.getLastRow();
@@ -1048,6 +1061,61 @@ function getHolidaysThisWeek() {
   const result = { holidays, birthdays, anniversaries };
   try { CACHE.put(cacheKey, JSON.stringify(result), 300); } catch (e) {}
   return result;
+}
+
+// ============================================================
+// CACHE WARMING
+// ------------------------------------------------------------
+// The shared CacheService entries above (wk_/gb_/soc_/hol_/admins) have
+// short TTLs (45s-600s) by design — they exist to coalesce near-simultaneous
+// requests, not to survive idle periods, and CacheService caps out at 6
+// hours even if asked for longer. Left alone, anyone loading the app after
+// it's sat idle for hours/days hits every one of these fully cold and pays
+// the full cost on that one request: two sheet reads, one Glass Box Calendar
+// API call, and one CalendarApp call for social events (CalendarApp is
+// genuinely slow — see getSocialEvents) — this combination is what caused
+// the original 30s timeouts. Proactively refreshing on a schedule means no
+// one has to be "the first person of the day" who eats that cost.
+//
+// Scoped to the current week only, not the ±2-week window the frontend
+// prefetches in the background — that prefetch is already non-blocking, so
+// warming it wouldn't fix anything a user actually feels, and getSocialEvents
+// specifically is expensive enough that multiplying it by 5 weeks on every
+// warming run isn't worth the added Apps Script execution quota.
+// ============================================================
+
+function warmSharedCaches() {
+  const today = new Date();
+  const day = today.getDay();
+  const monday = new Date(today.getFullYear(), today.getMonth(), today.getDate() + (day === 0 ? -6 : 1 - day));
+  const weekEnd = new Date(monday);
+  weekEnd.setDate(weekEnd.getDate() + 4);
+
+  const weekStartStr = Utilities.formatDate(monday, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  const weekEndStr = Utilities.formatDate(weekEnd, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+
+  // getGlassBoxWeek only uses user.access_token (to call the Calendar API as
+  // whoever's asking) — the trigger runs as the account that installed it,
+  // so ScriptApp.getOAuthToken() stands in for a real signed-in user's token.
+  try { getWeekData(weekStartStr); } catch (e) {}
+  try { getGlassBoxWeek(weekStartStr, { access_token: ScriptApp.getOAuthToken() }); } catch (e) {}
+  try { getSocialEvents(weekStartStr, weekEndStr); } catch (e) {}
+  try { getHolidaysThisWeek(); } catch (e) {}
+  try { isAdmin(''); } catch (e) {}
+}
+
+// One-time setup — run this once from the Apps Script editor (pick it in the
+// function dropdown, click Run) to install the warming schedule. Safe to
+// re-run: removes any existing trigger for this function first, so changing
+// the interval below and re-running never leaves duplicates.
+function installCacheWarmingTrigger() {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'warmSharedCaches') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('warmSharedCaches')
+    .timeBased()
+    .everyMinutes(5)
+    .create();
 }
 
 // ============================================================

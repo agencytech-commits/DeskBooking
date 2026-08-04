@@ -331,24 +331,72 @@ per-user and isn't warmed — proactively warming it for "whoever logs in
 next" isn't meaningful, though it's a single cheap sheet read on its own,
 not the multi-API bottleneck the others are.
 
+**Unverified interaction worth knowing about**: the concurrency limit
+described just below was measured between concurrent `doGet` web requests.
+Whether a `warmSharedCaches()` trigger execution firing at the same moment
+as a real user's request draws from the same concurrency pool (and could
+therefore itself cause the same failure) hasn't been tested. If flakiness
+ever correlates with the 5-minute trigger boundary, that's the first thing
+to check.
+
+### Apps Script concurrency limit — critical, affects every future change here
+
+**Google's Apps Script `/exec` endpoint cannot reliably handle concurrent
+requests to the same script.** This was measured directly (2026-08-04), not
+assumed: firing 4 simultaneous requests at the live deployment resulted in 1
+succeeding quickly and **3 failing after 30+ seconds** with a generic Google
+"Page not found" HTML page — not a `doGet` error, not something our own code
+produced or could catch. The failure happens inside Google's own
+infrastructure before the request ever reaches `doGet`. Firing 2 concurrent
+requests didn't fail outright, but the second one queued behind the first
+for ~12s even though a single request in isolation completes in 1-4s warm.
+
+This is the actual root cause of "the app is glitchy, I had to reload three
+times" and "still loading 20+ seconds after the loading screen finishes":
+the frontend's own initial load fires 3-4 requests at once
+(`getAll`/`getGlassBox`/`getMonthSummary`/`getHolidays`), and background
+prefetch can fire several more on top of that — comfortably enough to land
+in the broken zone. The Worker's `APPS_SCRIPT_TIMEOUT_MS` + retry logic
+(§4/§8) can't help here either, since from the Worker's point of view this
+is Apps Script returning a slow, malformed (non-JSON) response — which it
+already handles by returning a 502 — the problem is upstream of that, in
+how many requests hit Apps Script at once in the first place.
+
+**Fix: `app.html`'s `queued()` wrapper.** Every call through `api()`/`apiPost()`
+is funneled through a single JS promise chain (`appsScriptQueue`) so exactly
+one request to Apps Script is ever in flight app-wide, regardless of how
+many places want to fetch at once (initial load, background prefetch, rapid
+week-nav clicks, a retry firing while something else is pending). This is
+enforced centrally in `api()`/`apiPost()` — no caller needs to coordinate
+this itself, and nothing about `loadAll`/`loadGlassBox`/etc.'s own structure
+had to change. **Any new code that calls Apps Script must go through
+`api()`/`apiPost()`, not a raw `fetch()`** — bypassing the queue reintroduces
+this exact failure mode.
+
 ### Frontend load sequence
 
 `app.html` calls `getAll` first (desks + notes + social events + user prefs;
 returns `glassBox: {}` always, deferred on purpose), renders that immediately,
-then separately fires `getGlassBox` to fill in the Glass Box grid. If the
-second call fails, it fails **silently** (`loadGlassBox()` just returns on
-error, no console output) — so an Apps Script hiccup on that specific call
-looks identical to "nobody's booked the Glass Box this week," not an error.
-Reloading (or switching weeks and back) retries it. `getHolidays` (see below)
-has the same silent-failure behavior.
+then separately fires `getGlassBox` to fill in the Glass Box grid.
+`getAll`/`getGlassBox`/`getHolidays` each retry up to twice with backoff
+(1.5s, 3s) on failure or a null/error result before giving up — this exists
+independently of the concurrency queue above, as a defense against genuine
+transient failures (real network blips, an actual Apps Script error) that
+the queue doesn't prevent. `getAll` and `getGlassBox` show an explicit
+"Couldn't load — tap to retry" (clickable, re-triggers the same load) after
+retries are exhausted; `getHolidays` gives up quietly since it's informational
+only, not a booking action.
 
 On first page load only, the loader stays up until `refresh()` (desks +
 Glass Box), `loadMonthSummary()`, and `loadHolidays()` have all resolved
-(`Promise.all`, with a 12s safety backstop that reveals the page regardless
-so a hung call can't trap the user) — this avoids widgets popping in one by
-one after the loader animation ends. Subsequent week navigation doesn't wait
-on Glass Box the same way; it renders cached/desk data immediately and lets
-Glass Box fill in a moment later.
+(`Promise.all` — safe now that the queue above serializes the actual
+network calls underneath it; the backstop below is unrelated to that and
+guards against a genuinely stuck/very slow request instead), with a 12s
+safety backstop that reveals the page regardless so a hung call can't trap
+the user — this avoids widgets popping in one by one after the loader
+animation ends. Subsequent week navigation doesn't wait on Glass Box the
+same way; it renders cached/desk data immediately and lets Glass Box fill in
+a moment later.
 
 The header widget calls `getHolidays` (no params), which returns
 `{ success, holidays, birthdays, anniversaries }` — each an array of

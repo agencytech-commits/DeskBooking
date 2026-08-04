@@ -220,6 +220,8 @@
   .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
   .toast.error { background: var(--clementine); }
   .loading { text-align: center; padding: 44px; color: var(--text-faint); font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; }
+  .load-failed, .glass-load-failed { cursor: pointer; color: var(--clementine); }
+  .load-failed:hover, .glass-load-failed:hover { color: var(--clementine-deep); }
   /* Confetti canvas */
   #confetti-canvas { position: fixed; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 9999; }
   @media (max-width: 900px) { .week-grid, .glass-grid { grid-template-columns: repeat(3, 1fr); } }
@@ -573,9 +575,17 @@ function toggleHolidaySection(key) {
   if (title) title.classList.toggle('collapsed', collapsed);
 }
 
-async function loadHolidays() {
+async function loadHolidays(attempt) {
+  attempt = attempt || 0;
   const result = await api({ action: 'getHolidays' });
-  if (!result || result.error) return;
+  if (!result || result.error) {
+    // Same transient-hiccup reasoning as loadAll/loadGlassBox. Lower stakes
+    // than those two (informational only, no booking action lives here), so
+    // after retries it just gives up quietly rather than showing a
+    // dedicated failed state.
+    if (attempt < 2) setTimeout(() => loadHolidays(attempt + 1), 1500 * (attempt + 1));
+    return;
+  }
   holidaysCache = result.holidays || [];
   birthdaysCache = result.birthdays || [];
   anniversariesCache = result.anniversaries || [];
@@ -653,20 +663,42 @@ function updateNavButtons() {
 }
 
 // ── API ───────────────────────────────────────────────────────
+// Apps Script's exec endpoint can't reliably handle concurrent requests to
+// the same script — confirmed by direct testing: firing several simultaneous
+// requests caused most of them to fail after 30+ seconds with a generic
+// Google "Page not found" page. That failure happens inside Google's own
+// infrastructure before it ever reaches our doGet code, so no amount of
+// retry logic on our end can catch or prevent it — the only fix is to never
+// send concurrent requests in the first place. Every api()/apiPost() call
+// is funneled through this queue so exactly one is ever in flight, no
+// matter how many places in the app want to fetch at once (initial load,
+// background prefetch, rapid week-nav clicks, a retry firing while
+// something else is still pending, etc.).
+let appsScriptQueue = Promise.resolve();
+function queued(fn) {
+  const run = appsScriptQueue.then(fn, fn);
+  appsScriptQueue = run.then(() => {}, () => {}); // never let one failure block the queue
+  return run;
+}
+
 async function api(params) {
-  const url = new URL(WORKER + '/api');
-  Object.entries(params).forEach(([k,v]) => url.searchParams.set(k,v));
-  const res = await fetch(url.toString(), { credentials: 'include' });
-  if (res.status === 401) { window.location.href = WORKER+'/signout'; return null; }
-  return res.json();
+  return queued(async () => {
+    const url = new URL(WORKER + '/api');
+    Object.entries(params).forEach(([k,v]) => url.searchParams.set(k,v));
+    const res = await fetch(url.toString(), { credentials: 'include' });
+    if (res.status === 401) { window.location.href = WORKER+'/signout'; return null; }
+    return res.json();
+  });
 }
 async function apiPost(body) {
-  const res = await fetch(WORKER + '/api', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    credentials: 'include', body: JSON.stringify(body)
+  return queued(async () => {
+    const res = await fetch(WORKER + '/api', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      credentials: 'include', body: JSON.stringify(body)
+    });
+    if (res.status === 401) { window.location.href = WORKER+'/signout'; return null; }
+    return res.json();
   });
-  if (res.status === 401) { window.location.href = WORKER+'/signout'; return null; }
-  return res.json();
 }
 
 // ── USER ─────────────────────────────────────────────────────
@@ -713,7 +745,8 @@ async function revalidateWeek(ws) {
   }
 }
 
-async function loadAll(awaitGlassBox) {
+async function loadAll(awaitGlassBox, attempt) {
+  attempt = attempt || 0;
   const ws = dateStr(currentWeekStart);
   updateNavButtons();
 
@@ -727,20 +760,32 @@ async function loadAll(awaitGlassBox) {
     return;
   }
 
-  // Show existing content faded while loading
+  // Show existing content faded while loading (only on the first attempt —
+  // a retry shouldn't reset an already-showing "Loading…" back to itself).
   const grid = document.getElementById('weekGrid');
-  const existing = grid.innerHTML;
-  if (existing && !existing.includes('Loading')) {
-    grid.querySelectorAll('.day-card').forEach(c => c.classList.add('loading-state'));
-  } else {
-    grid.innerHTML = '<div class="loading">Loading…</div>';
+  if (attempt === 0) {
+    const existing = grid.innerHTML;
+    if (existing && !existing.includes('Loading')) {
+      grid.querySelectorAll('.day-card').forEach(c => c.classList.add('loading-state'));
+    } else {
+      grid.innerHTML = '<div class="loading">Loading…</div>';
+    }
+    document.getElementById('glassGrid').innerHTML = '<div class="glass-loading">Loading calendar…</div>';
   }
-  document.getElementById('glassGrid').innerHTML = '<div class="glass-loading">Loading calendar…</div>';
 
   // Fetch desks + social (fast — sheet only)
   const result = await api({ action: 'getAll', weekStart: ws });
-  if (!result) return;
-  if (result.error) { grid.innerHTML = '<div class="loading">Failed to load.</div>'; return; }
+  if (!result || result.error) {
+    // A single transient Apps Script/network hiccup shouldn't require a full
+    // page reload to recover from — retry a couple of times with backoff
+    // before giving up and showing something the user can act on.
+    if (attempt < 2) {
+      setTimeout(() => loadAll(awaitGlassBox, attempt + 1), 1500 * (attempt + 1));
+      return;
+    }
+    grid.innerHTML = '<div class="loading load-failed" onclick="refresh(true)">Couldn\'t load — tap to retry</div>';
+    return;
+  }
 
   if (result.prefs) renderUser(result.prefs);
   cacheWeekResult(ws, result);
@@ -752,13 +797,27 @@ async function loadAll(awaitGlassBox) {
   if (awaitGlassBox) await glassPromise;
 }
 
-async function loadGlassBox(ws) {
+async function loadGlassBox(ws, attempt) {
+  attempt = attempt || 0;
   if (glassCache[ws]) {
     renderGlassFromCache(ws);
     return;
   }
   const result = await api({ action: 'getGlassBox', weekStart: ws });
-  if (!result || result.error) return;
+  if (!result || result.error) {
+    // Same reasoning as loadAll: a single hiccup shouldn't permanently blank
+    // both the live events and the "Book Glass Box" form until a full page
+    // reload — retry, then show something clickable instead of nothing.
+    if (attempt < 2) {
+      setTimeout(() => loadGlassBox(ws, attempt + 1), 1500 * (attempt + 1));
+      return;
+    }
+    if (dateStr(currentWeekStart) === ws) {
+      const grid = document.getElementById('glassGrid');
+      if (grid) grid.innerHTML = `<div class="glass-loading glass-load-failed" onclick="loadGlassBox('${ws}')">Couldn't load the Glass Box — tap to retry</div>`;
+    }
+    return;
+  }
   glassCache[ws] = result.glassBox || {};
   // Only render if still on this week
   if (dateStr(currentWeekStart) === ws) renderGlassFromCache(ws);

@@ -151,6 +151,44 @@ function doGet(e) {
           anniversaries: cal.anniversaries
         });
       }
+      case 'getInitialLoadShared': {
+        // The non-personal subset of getInitialLoad: everything in it is
+        // identical for every caller asking about the same weekStart+
+        // monthStart (the desk grid, social events, Glass Box, holidays —
+        // all shared data; `mine`/`prefs` are deliberately left out, see
+        // getPersonal). That's what lets tce-oauth-worker.js cache this
+        // action's response at Cloudflare's edge and skip calling Apps
+        // Script entirely on a cache hit — see ARCHITECTURE.md's "Cloudflare
+        // edge cache" section. Paired with getPersonal for the small,
+        // always-live per-user remainder. Only used for first render (same
+        // as getInitialLoad); ongoing navigation still uses the individual
+        // actions above.
+        const weekResult = getAllData(e.parameter.weekStart, user);
+        const glass = getGlassBoxWeek(e.parameter.weekStart, user);
+        const monthFull = getMonthFullFlags(e.parameter.monthStart);
+        const cal = getHolidaysThisWeek();
+        const monthSummaryDays = {};
+        Object.keys(monthFull.days).forEach(date => {
+          monthSummaryDays[date] = { full: monthFull.days[date] };
+        });
+        return jsonResponse({
+          success: true,
+          days: weekResult.days,
+          socialEvents: weekResult.socialEvents,
+          glassBox: glass.glassBox,
+          monthSummaryDays,
+          holidays: cal.holidays,
+          birthdays: cal.birthdays,
+          anniversaries: cal.anniversaries
+        });
+      }
+      case 'getPersonal':
+        // The personal counterpart to getInitialLoadShared — prefs and which
+        // days this month are this caller's own bookings. Deliberately never
+        // cached at Cloudflare (it's per-user, and the Worker already has
+        // most of it for free from the session cookie — see the Worker for
+        // what it actually still asks Apps Script for).
+        return jsonResponse(getPersonalData(e.parameter.monthStart, user));
       default:
         return jsonResponse({ error: 'Unknown action: ' + action });
     }
@@ -599,17 +637,12 @@ function cancelDesk(data, user) {
 // MONTH SUMMARY / BULK WEEK ACTIONS
 // ============================================================
 
-// Per day in the month: `mine` is 'core'|'overflow'|null (the caller's own booking
-// that day, if any) and `full` is true when every core desk (1-TOTAL_CORE_DESKS) is
-// completely occupied that day (either a 'full' row, or both an AM and a PM row).
-function getMonthSummary(monthStart, user) {
-  // Per-user cache: the whole-sheet read + occupancy calc is the slow part, and
-  // the header calendar re-requests it on every page load. TTL is a backstop —
-  // the user's own writes invalidate it via invalidateMonth() for instant freshness.
-  const cacheKey = 'ms_' + normEmail(user.email) + '_' + monthKeyOf(monthStart);
-  const cached = CACHE.get(cacheKey);
-  if (cached) return JSON.parse(cached);
-
+// Scans Bookings once for a month, returning per-date core-desk rows (used to
+// derive `full`) and, only when `email` is given, that one user's own booking
+// status per date (used to derive `mine`). Split out so the `full` half — which
+// doesn't depend on who's asking — can be computed and cached once for everyone
+// (getMonthFullFlags) instead of redundantly per-user inside getMonthSummary.
+function scanMonthBookings(monthStart, email) {
   const start = new Date(monthStart);
   const year = start.getFullYear();
   const monthIndex = start.getMonth();
@@ -618,7 +651,7 @@ function getMonthSummary(monthStart, user) {
 
   const sheet = getSheet('Bookings');
   const allData = sheet.getDataRange().getValues();
-  const target = normEmail(user.email);
+  const target = email ? normEmail(email) : null;
 
   const coreRowsByDate = {};
   const mineByDate = {};
@@ -633,26 +666,88 @@ function getMonthSummary(monthStart, user) {
       if (!coreRowsByDate[rowDate]) coreRowsByDate[rowDate] = [];
       coreRowsByDate[rowDate].push({ desk, slot: normSlot(row[5]) });
     }
-    if (normEmail(row[3]) === target) {
+    if (target && normEmail(row[3]) === target) {
       mineByDate[rowDate] = desk <= TOTAL_CORE_DESKS ? 'core' : 'overflow';
     }
   }
+  return { coreRowsByDate, mineByDate };
+}
 
-  const allDates = new Set([...Object.keys(coreRowsByDate), ...Object.keys(mineByDate)]);
+// true when every core desk (1-TOTAL_CORE_DESKS) is completely occupied that
+// day (either a 'full' row, or both an AM and a PM row) — per date.
+function fullFlagsFrom(coreRowsByDate) {
   const days = {};
-  allDates.forEach(date => {
+  Object.keys(coreRowsByDate).forEach(date => {
     const coreRows = coreRowsByDate[date] || [];
     let full = true;
     for (let d = 1; d <= TOTAL_CORE_DESKS; d++) {
       const occ = getDeskOccupancy(coreRows, d);
       if (!(occ.amTaken && occ.pmTaken)) { full = false; break; }
     }
-    days[date] = { mine: mineByDate[date] || null, full };
+    days[date] = full;
+  });
+  return days;
+}
+
+// Per day in the month: `mine` is 'core'|'overflow'|null (the caller's own booking
+// that day, if any) and `full` is true when every core desk is fully booked.
+// Still used for month navigation after the first load (see getMonthFullFlags
+// for the shared-only variant used by getInitialLoadShared/the Cloudflare cache).
+function getMonthSummary(monthStart, user) {
+  // Per-user cache: the whole-sheet read + occupancy calc is the slow part, and
+  // the header calendar re-requests it on every page load. TTL is a backstop —
+  // the user's own writes invalidate it via invalidateMonth() for instant freshness.
+  const cacheKey = 'ms_' + normEmail(user.email) + '_' + monthKeyOf(monthStart);
+  const cached = CACHE.get(cacheKey);
+  if (cached) return JSON.parse(cached);
+
+  const { coreRowsByDate, mineByDate } = scanMonthBookings(monthStart, user.email);
+  const fullByDate = fullFlagsFrom(coreRowsByDate);
+  const allDates = new Set([...Object.keys(coreRowsByDate), ...Object.keys(mineByDate)]);
+  const days = {};
+  allDates.forEach(date => {
+    days[date] = { mine: mineByDate[date] || null, full: fullByDate[date] };
   });
 
   const out = { success: true, days };
   try { CACHE.put(cacheKey, JSON.stringify(out), 120); } catch (e) {}
   return out;
+}
+
+// The non-personal subset of getMonthSummary — `full` is identical for every
+// caller asking about the same month, so unlike ms_ (cached per-user) this is
+// cached once, under one key, for everyone. This is what getInitialLoadShared
+// exposes, which is what makes that action safe for tce-oauth-worker.js to
+// cache at Cloudflare's edge — see ARCHITECTURE.md's Cloudflare edge cache
+// section for the full reasoning.
+function getMonthFullFlags(monthStart) {
+  const cacheKey = 'msf_' + monthKeyOf(monthStart);
+  const cached = CACHE.get(cacheKey);
+  if (cached) return JSON.parse(cached);
+
+  const { coreRowsByDate } = scanMonthBookings(monthStart, null);
+  const days = fullFlagsFrom(coreRowsByDate);
+
+  const out = { success: true, days };
+  try { CACHE.put(cacheKey, JSON.stringify(out), 300); } catch (e) {}
+  return out;
+}
+
+// The personal remainder left out of getInitialLoadShared: `prefs` (this
+// caller's own name/email/picture/admin flag) and `mine` (which dates this
+// month they themselves have booked, and whether core or overflow). Reuses
+// getMonthSummary's per-user cache rather than re-scanning the sheet.
+function getPersonalData(monthStart, user) {
+  const month = getMonthSummary(monthStart, user);
+  const mine = {};
+  Object.keys(month.days).forEach(date => {
+    if (month.days[date].mine) mine[date] = month.days[date].mine;
+  });
+  return {
+    success: true,
+    prefs: { name: user.name, email: user.email, picture: user.picture || '', isAdmin: isAdmin(user.email) },
+    mine
+  };
 }
 
 function bookMyWeek(data, user) {

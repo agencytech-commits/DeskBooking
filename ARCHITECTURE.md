@@ -126,20 +126,81 @@ while chasing load-time complaints:
    outage once before (§9) and deserves its own careful test pass rather than
    a drive-by change alongside unrelated fixes.
 
-**Not done, and deliberately left as options rather than changes:**
-- Splitting `getGlassBoxWeek`'s Calendar API call back out of `getInitialLoad`
-  (it was folded in for round-trip-count reasons — see the concurrency
-  section below) — the `GLASS_TTL` bump above addresses the same risk more
-  cheaply, so this is only worth revisiting if staleness/latency on `gb_`
-  turns out to still be a problem in practice.
-- Edge-caching cacheable `GET /api` actions (`getHolidays`, `getMonthSummary`,
-  etc.) at Cloudflare using the Worker's `caches.default`, so a repeat page
-  load within the TTL window is served from Cloudflare's edge without ever
-  reaching Apps Script at all. This would also reduce concurrent-request
-  pressure on Apps Script (see the concurrency limit below), which is the
-  more fundamental bottleneck — but it's a genuine architecture change (cache
-  key design, keeping it in sync with the per-user fields already in some of
-  these responses) rather than a safe drive-by edit.
+**Not done, left as an option:** splitting `getGlassBoxWeek`'s Calendar API
+call back out of `getInitialLoadShared` (it was folded in for round-trip-count
+reasons — see the concurrency section below) — the `GLASS_TTL` bump above
+addresses the same risk more cheaply, so this is only worth revisiting if
+staleness/latency on `gb_` turns out to still be a problem in practice.
+
+### Cloudflare edge cache for shared data (2026-08-04)
+
+Direct measurement (repeated calls to `getHolidays` — the cheapest possible
+action, a single cache hit with zero external API calls) showed Apps Script's
+`/exec` endpoint itself varying **1.4s–11s+ between back-to-back calls** with
+identical inputs. That's latency in Google's own request routing before the
+script even runs — nothing in this codebase can reduce it, only avoid paying
+it. The only way to actually eliminate it for a given load is to not call
+Apps Script at all. That's what this does, for the parts of a page load where
+it's possible.
+
+**The split.** `getInitialLoad`'s response was almost entirely the same for
+every caller asking about a given `weekStart`+`monthStart` — desk grid,
+social events, Glass Box, holidays/birthdays/anniversaries, and the month
+calendar's `full` flags. Only two things in it were genuinely per-caller:
+`prefs` (their own name/email/picture/admin flag) and the month calendar's
+`mine` flag (which days *they* booked). So the one action became two:
+
+- **`getInitialLoadShared`** (`code.gs`) — everything shared, nothing
+  personal. `getMonthSummary`'s scan was split into `scanMonthBookings()` +
+  `fullFlagsFrom()` so the shared `full` flags can be computed and cached
+  once per month for everyone (`msf_<month>`), instead of redundantly inside
+  every user's own `ms_<email>_<month>` cache entry the way it was before.
+- **`getPersonal`** (`code.gs`) — just `prefs` and `mine`, reusing
+  `getMonthSummary`'s existing per-user cache rather than re-scanning.
+- **`tce-oauth-worker.js`** caches `getInitialLoadShared`'s response at
+  Cloudflare's edge (`caches.default`), keyed on a *synthetic* URL containing
+  only `weekStart`+`monthStart` — deliberately never the real request URL,
+  which carries `workerEmail`/`workerToken`. Getting this key construction
+  wrong is the one way this feature could leak data (a key that varies by
+  caller identity defeats the cache; a shared payload that accidentally
+  includes `prefs`/`mine` would leak one user's identity/admin status to
+  whoever else hits the same cache entry) — this is exactly why the split
+  above exists at the data-shape level, not just as a cache-key trick.
+  `SHARED_CACHE_TTL_SECONDS = 60`. On a hit, Apps Script is never called at
+  all for that portion of the load.
+- **`app.html`'s `loadInitial()`** fires both calls together rather than one
+  awaiting the other, so the (potentially slow, always-live) personal call
+  never blocks the shared render behind it. The desk grid/Glass Box/holidays
+  render as soon as `getInitialLoadShared` resolves; "my desk" highlighting
+  and admin-only controls in that same grid depend on `currentUser`, which
+  isn't set until `getPersonal` resolves a moment later — so the week grid is
+  deliberately re-rendered (same cached data, no extra network call) once it
+  does, to catch that highlighting up rather than leave it missing.
+
+**Trade-offs accepted, deliberately:**
+- **No purge-on-write.** Cloudflare's cache has no hook into
+  `invalidateWeek()`/`invalidateMonth()` on the Apps Script side — a 60s TTL
+  is the only freshness mechanism here, not an invalidation call. This is
+  safe specifically because the booking flow itself (`bookDesk`, `cancelDesk`,
+  `bookMyWeek`, `bookGlassBox`, …) never reads through this cache — it always
+  goes through the unchanged, always-live `getAll`/`getGlassBox`/
+  `getMonthSummary` actions, invalidated exactly as before. The *only* case
+  the 60s window bounds is someone hard-refreshing the whole page within a
+  minute of *someone else's* booking change — same category of trade-off as
+  every other TTL in the caching table above, just at a different layer.
+- **A cold miss now costs two Apps Script round trips instead of one**
+  (`getInitialLoadShared` + `getPersonal`, both still queued through the
+  same serialized `api()`/`apiPost()` mechanism — see the concurrency
+  section below). This is the opposite of the round-trip-count optimization
+  `getInitialLoad` was originally built for. The bet: with a single office
+  full of people loading the same current week, most requests land on a
+  *warm* Cloudflare cache (near-zero latency, bypassing Apps Script
+  entirely) far more often than they land on a genuinely cold one, so this
+  trade is net-positive in practice — but it is a real trade, not a free win.
+- `caches.default` is per-edge-node, not globally shared across every
+  Cloudflare colo — the first request to hit a given edge node still pays
+  the full cost. That's expected and fine: the benefit is people in the same
+  office/region sharing a cache, not a single global one.
 
 ## 5. Request routing reference
 

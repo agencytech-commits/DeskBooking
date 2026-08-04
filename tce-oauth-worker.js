@@ -14,6 +14,23 @@ const DOMAIN = 'thecontentemporium.co.uk';
 // graceful 502 instead of leaving the request (and the user) stuck.
 const APPS_SCRIPT_TIMEOUT_MS = 20000;
 
+// getInitialLoadShared's response is identical for every caller asking about
+// the same weekStart+monthStart (see that action's comment in code.gs) — it
+// deliberately excludes anything per-user (prefs, "mine"). That's what makes
+// it safe to cache here at Cloudflare's edge, keyed on weekStart+monthStart
+// only (no session/user data in the key) — a cache hit skips the call to
+// Apps Script entirely, sidestepping its per-request latency variance rather
+// than just reducing how often it's hit. Kept short and TTL-only (no
+// purge-on-write): the actual booking flow (bookDesk/cancelDesk/etc.) never
+// reads through this cache — it goes through the always-live getAll/
+// getGlassBox/getMonthSummary actions, which is why a write shows up for the
+// person who made it immediately regardless of this TTL. The only case this
+// TTL bounds is someone else hard-refreshing the whole page within this
+// window of another person's booking change — a short, rare, low-stakes
+// staleness window, same category of trade-off as every other TTL in this
+// app (see ARCHITECTURE.md's caching table).
+const SHARED_CACHE_TTL_SECONDS = 60;
+
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': 'https://deskbooking.agencytech.workers.dev',
   'Access-Control-Allow-Credentials': 'true',
@@ -35,7 +52,7 @@ function decodeSession(str) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     // ── CORS PREFLIGHT ──────────────────────────────────────
@@ -140,16 +157,36 @@ export default {
       };
 
       if (request.method === 'GET') {
-        // Forward query params to Apps Script
-        const asUrl = new URL(APPS_SCRIPT_URL);
-        for (const [k, v] of url.searchParams) {
-          if (k !== 'sessionId') asUrl.searchParams.set(k, v);
+        const action = url.searchParams.get('action');
+
+        if (action === 'getInitialLoadShared') {
+          const cache = caches.default;
+          const cacheKey = sharedCacheKey(url);
+
+          const cached = await cache.match(cacheKey);
+          if (cached) {
+            return withCookie(new Response(cached.body, { headers: { 'Content-Type': 'application/json', ...CORS_HEADERS } }));
+          }
+
+          const asUrl = buildAppsScriptUrl(url, refreshed);
+          const result = await fetchAppsScriptJson(
+            () => fetch(asUrl.toString(), { redirect: 'follow', signal: AbortSignal.timeout(APPS_SCRIPT_TIMEOUT_MS) }),
+            { retries: 1 }
+          );
+          if (!result.ok) return withCookie(jsonResponse({ error: result.error }, 502));
+
+          const body = JSON.stringify(result.data);
+          // Cache the raw response body (not the parsed object) so the hit
+          // path above can hand it straight back with no re-serialization.
+          // waitUntil so populating the cache never delays this response.
+          ctx.waitUntil(cache.put(cacheKey, new Response(body, {
+            headers: { 'Content-Type': 'application/json', 'Cache-Control': `public, max-age=${SHARED_CACHE_TTL_SECONDS}` }
+          })));
+          return withCookie(new Response(body, { headers: { 'Content-Type': 'application/json', ...CORS_HEADERS } }));
         }
-        // Pass user info for getAll
-        asUrl.searchParams.set('workerEmail', refreshed.email);
-        asUrl.searchParams.set('workerName', refreshed.name);
-        asUrl.searchParams.set('workerPicture', refreshed.picture || '');
-        asUrl.searchParams.set('workerToken', refreshed.access_token);
+
+        // Forward query params to Apps Script
+        const asUrl = buildAppsScriptUrl(url, refreshed);
 
         // Reads are idempotent → one retry masks a transient Apps Script hiccup.
         const result = await fetchAppsScriptJson(
@@ -221,6 +258,33 @@ export default {
 };
 
 // ── HELPERS ──────────────────────────────────────────────────
+
+// Builds the Apps Script exec URL for a GET request, forwarding the caller's
+// query params plus their identity from the session.
+function buildAppsScriptUrl(url, session) {
+  const asUrl = new URL(APPS_SCRIPT_URL);
+  for (const [k, v] of url.searchParams) {
+    if (k !== 'sessionId') asUrl.searchParams.set(k, v);
+  }
+  asUrl.searchParams.set('workerEmail', session.email);
+  asUrl.searchParams.set('workerName', session.name);
+  asUrl.searchParams.set('workerPicture', session.picture || '');
+  asUrl.searchParams.set('workerToken', session.access_token);
+  return asUrl;
+}
+
+// Cache key for getInitialLoadShared — deliberately built from a synthetic
+// URL containing ONLY weekStart/monthStart, never the real request URL
+// (which carries workerEmail/workerToken/etc as query params). Using the raw
+// request as the key would fragment the cache per-user and defeat the point
+// of this cache entirely, since every user's request would look like a
+// distinct cache key.
+function sharedCacheKey(url) {
+  const key = new URL('https://tce-shared-cache.internal/getInitialLoadShared');
+  key.searchParams.set('weekStart', url.searchParams.get('weekStart') || '');
+  key.searchParams.set('monthStart', url.searchParams.get('monthStart') || '');
+  return new Request(key.toString());
+}
 
 function getSessionCookie(request) {
   const cookie = request.headers.get('Cookie') || '';

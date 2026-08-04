@@ -1290,12 +1290,19 @@ async function goToMonthDay(ds) {
 }
 renderHeaderDateTime();
 setInterval(renderHeaderDateTime, 1000);
-// ── INITIAL LOAD (one consolidated request, first render only) ─────────
-// Replaces separately awaiting refresh()+loadMonthSummary()+loadHolidays()
-// with a single getInitialLoad call — see the comment on that action in
-// code.gs for why. Manually populates exactly the same caches and calls the
-// same render functions those three would have, so this is purely a
-// round-trip-count optimization, not a behavior change.
+// ── INITIAL LOAD (split shared/personal, first render only) ────────────
+// Two calls instead of one: getInitialLoadShared (everything that's
+// identical for every caller asking about this weekStart+monthStart — desk
+// grid, socials, Glass Box, holidays, month "full" flags) and getPersonal
+// (this caller's own prefs + which days this month are their own bookings).
+// See the comment on getInitialLoadShared in code.gs and the Cloudflare
+// edge-cache comment in tce-oauth-worker.js for why: the shared call is
+// cacheable at Cloudflare's edge across every user asking about the same
+// week, the personal one deliberately isn't (and doesn't need to be — it's
+// small). Both are fired together (not awaited in sequence) so the personal
+// call — which still goes to Apps Script every time — never blocks the
+// shared render behind it; the shared render is what determines how fast
+// the page *feels* loaded.
 async function loadInitial(attempt) {
   attempt = attempt || 0;
   const ws = dateStr(currentWeekStart);
@@ -1315,37 +1322,57 @@ async function loadInitial(attempt) {
     renderMonthCalendar();
   }
 
-  const result = await api({ action: 'getInitialLoad', weekStart: ws, monthStart });
+  // Both queued together — see comment above for why neither awaits the other here.
+  const sharedPromise = api({ action: 'getInitialLoadShared', weekStart: ws, monthStart });
+  const personalPromise = api({ action: 'getPersonal', monthStart });
 
-  if (!result || result.error) {
+  const shared = await sharedPromise;
+  if (!shared || shared.error) {
     if (attempt < 2) {
       setTimeout(() => loadInitial(attempt + 1), 1500 * (attempt + 1));
       return;
     }
-    // getInitialLoad failed after retries — fall back to the original four
-    // separate, independently-proven calls rather than leaving the user
-    // with nothing.
+    // Failed after retries — fall back to the original, independently-proven
+    // separate calls rather than leaving the user with nothing.
     await Promise.all([refresh(true), loadMonthSummary(), loadHolidays()]);
     return;
   }
 
-  if (result.prefs) renderUser(result.prefs);
-  cacheWeekResult(ws, result);
+  cacheWeekResult(ws, shared);
   renderWeekFromCache(ws);
 
-  glassCache[ws] = result.glassBox || {};
+  glassCache[ws] = shared.glassBox || {};
   if (dateStr(currentWeekStart) === ws) renderGlassFromCache(ws);
 
-  monthCache = { year: now.getFullYear(), month: now.getMonth(), days: result.monthSummaryDays || {} };
+  monthCache = { year: now.getFullYear(), month: now.getMonth(), days: shared.monthSummaryDays || {} };
   renderMonthCalendar();
-  try { localStorage.setItem('tce_month_' + monthKey, JSON.stringify(result.monthSummaryDays || {})); } catch(e) {}
+  try { localStorage.setItem('tce_month_' + monthKey, JSON.stringify(shared.monthSummaryDays || {})); } catch(e) {}
 
-  holidaysCache = result.holidays || [];
-  birthdaysCache = result.birthdays || [];
-  anniversariesCache = result.anniversaries || [];
+  holidaysCache = shared.holidays || [];
+  birthdaysCache = shared.birthdays || [];
+  anniversariesCache = shared.anniversaries || [];
   renderHolidays();
 
   schedulePrefetch();
+
+  // Personal fields land whenever this resolves, independent of the shared
+  // render above — until it does, currentUser is still its empty default,
+  // so "my desk"/admin-cancel highlighting in the just-rendered week grid
+  // won't show yet. Re-render the same (already-fetched, unchanged) week
+  // data once it lands so that highlighting catches up with no extra
+  // network call.
+  const personal = await personalPromise;
+  if (personal && !personal.error) {
+    if (personal.prefs) renderUser(personal.prefs);
+    if (dateStr(currentWeekStart) === ws) renderWeekFromCache(ws);
+    if (monthCache.days) {
+      Object.keys(personal.mine || {}).forEach(date => {
+        if (!monthCache.days[date]) monthCache.days[date] = {};
+        monthCache.days[date].mine = personal.mine[date];
+      });
+      renderMonthCalendar();
+    }
+  }
 }
 
 // ── LOADING SCREEN (hide once first data render completes) ─────

@@ -199,8 +199,13 @@ export default {
       return Response.redirect('https://deskbooking.agencytech.workers.dev/signin.html', 302);
     }
 
-    // ── PASS THROUGH ─────────────────────────────────────────
-    return fetch(request);
+    // ── NOT FOUND ────────────────────────────────────────────
+    // Never `fetch(request)` here: this Worker owns its own hostname, so
+    // re-fetching the inbound URL just re-enters this same Worker and spins
+    // an infinite subrequest loop that hangs the request (and starves the
+    // isolate). Static files are served by the assets binding before the
+    // Worker runs, so anything reaching this point genuinely does not exist.
+    return new Response('Not found', { status: 404 });
   }
 };
 

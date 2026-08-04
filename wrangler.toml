@@ -2,3 +2,18 @@ name = "tce-oauth"
 main = "tce-oauth-worker.js"
 compatibility_date = "2025-09-01"
 workers_dev = true
+
+# The HTML lives in public/ rather than the repo root so the Worker script —
+# which holds the OAuth client secret — is never served as a static asset.
+[assets]
+directory = "./public"
+not_found_handling = "none"
+# Without this, the asset server 307s /index.html -> / , and since / is
+# worker-first (and redirects to signin) the app becomes unreachable:
+# /app -> /index.html -> / -> signin -> /app -> ... an endless loop.
+# "none" serves .html paths verbatim, which is what the Worker's redirects
+# already point at.
+html_handling = "none"
+# Assets win by default, which would serve index.html at / and bypass the
+# session check. These paths must reach the Worker instead.
+run_worker_first = ["/", "/api", "/app", "/callback", "/signout"]

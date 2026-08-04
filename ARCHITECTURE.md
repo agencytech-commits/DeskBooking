@@ -288,11 +288,29 @@ one after the loader animation ends. Subsequent week navigation doesn't wait
 on Glass Box the same way; it renders cached/desk data immediately and lets
 Glass Box fill in a moment later.
 
-The header's "Away this week" widget calls `getHolidays` (no params), which
-returns `{ success, holidays: [{ name, start, end }] }` from
-`getHolidaysThisWeek()` — everyone away this week, not scoped to the
-currently-viewed week. The frontend filters to `end >= today` and sorts by
-end date (soonest-back first); it only reads `name` and `end` from each entry.
+The header widget calls `getHolidays` (no params), which returns
+`{ success, holidays, birthdays, anniversaries }` — each an array of
+`{ name, start, end }` — from `getHolidaysThisWeek()`. All three come from
+**one shared calendar** (`HOLIDAYS_CALENDAR_ID`); there's no separate
+calendar per category, so `code.gs`'s `classifyCalendarEvent()` buckets each
+event purely by a keyword in its title (`anniversary` → anniversaries,
+`birthday` → birthdays, anything else → a real absence), and
+`cleanEventName()` strips that keyword (plus a leading possessive `'s`) so
+"Jane Smith's Birthday" displays as just "Jane Smith" under the "🎂 Birthdays
+this week" heading rather than repeating itself. **This is keyword matching
+against whatever's typed into that calendar's event titles** — if someone
+titles an event unconventionally (no "Birthday"/"Anniversary" in the title,
+or a typo), it silently falls into the "Away this week" bucket instead.
+There's no calendar-side field or color being read, only the title string.
+
+All three lists are scoped to the current calendar week (Mon–Fri), not the
+currently-viewed booking week. The frontend filters each to `end >= today`
+and sorts by end date (soonest-ending first).
+
+Each of the three sections in the widget is independently collapsible
+(click the section title). Collapsed/expanded state is saved to
+`localStorage` (`tce_section_collapsed`) — per-browser, not tied to the
+Google account, so it won't follow someone to a different device or browser.
 
 ## 9. Notable gotchas found while deploying (2026-08-04)
 

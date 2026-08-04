@@ -15,7 +15,20 @@
 const SHEET_ID = '1C1k-ZMmizDFf357fAQvKdKgjmgaP8V_zmGrie-KR0vI';
 const GLASS_BOX_CALENDAR = 'c_1880lps1iqdbajhuggvb8tlc8i36g@resource.calendar.google.com';
 const SOCIAL_CALENDAR_ID = 'c_41272cd4467c35eed3257bd6912351aeeb5f781d00f7eafdf345ba6ebf7ea08c@group.calendar.google.com';
-const HOLIDAYS_CALENDAR_ID = 'c_5e178bad5a49c015d7530dc1cc5bf8e697a56255811f4d1fef4a6d2f4a401f22@group.calendar.google.com';
+// Sage HR's calendar-sync feed (Settings > Calendar sync in Sage) — a plain
+// iCal (.ics) file, not a Google Calendar. https:// works identically to the
+// webcal:// scheme it's given out as; UrlFetchApp doesn't understand webcal.
+//
+// The URL itself is a bearer secret — anyone who has it can read the whole
+// company's leave/birthday/anniversary data with no further auth — so it's
+// a Script Property (Project Settings > Script Properties in the Apps
+// Script editor), not a hardcoded constant in this file. This file is
+// committed to a repo; a Script Property isn't.
+function getSageIcsUrl() {
+  const url = PropertiesService.getScriptProperties().getProperty('SAGE_ICS_URL');
+  if (!url) throw new Error('SAGE_ICS_URL script property not set — see ARCHITECTURE.md section 8.');
+  return url;
+}
 const DOMAIN = 'thecontentemporium.co.uk';
 const TOTAL_CORE_DESKS = 12;
 const OFFICE_START_HOUR = 8;
@@ -278,6 +291,7 @@ function getSheet(name) {
     if (name === 'Bookings') sheet.appendRow(['Date', 'Desk', 'Name', 'Email', 'BookedAt', 'Slot', 'Dog']);
     if (name === 'DayNotes') sheet.appendRow(['Date', 'Note', 'UpdatedAt', 'UpdatedBy']);
     if (name === 'Admins') sheet.appendRow(['Email']);
+    if (name === 'SageEvents') sheet.appendRow(['Name', 'Kind', 'Start', 'End']);
   }
   return sheet;
 }
@@ -868,16 +882,26 @@ function getSocialEvents(startDate, endDate) {
 }
 
 // ============================================================
-// HOLIDAYS (staff absence calendar)
+// HOLIDAYS / BIRTHDAYS / ANNIVERSARIES (Sage HR calendar-sync feed)
+// ------------------------------------------------------------
+// Sage exposes one iCal feed mixing absences, birthdays, and work
+// anniversaries, distinguished only by a keyword in each event's title (no
+// separate feed, no field to key off — see classifyCalendarEvent). Fetching
+// and parsing that feed live on every request would mean a slow or
+// unreachable Sage directly breaks the app, so instead:
+//
+//   refreshHolidaysFromSage() — fetches + parses the feed, writes every
+//     event into the SageEvents sheet tab. Runs weekly via a trigger (see
+//     installSageWeeklyTrigger), never per-request.
+//   getHolidaysThisWeek() — reads SageEvents (fast local sheet read),
+//     filtered to the current Mon–Fri window. This is what actually serves
+//     the getHolidays API action; it never talks to Sage directly.
+//
+// If a week goes by without the trigger firing (quota issue, feed down,
+// etc.), the app just keeps serving last week's SageEvents snapshot rather
+// than breaking — stale is preferable to broken here.
 // ============================================================
 
-// The shared calendar mixes three kinds of events under one calendar ID:
-// actual absences, birthdays, and work anniversaries — distinguished only by
-// a keyword in the title (no separate calendar, no event color/type to key
-// off). classifyCalendarEvent buckets each event; cleanEventName strips the
-// keyword (and a leading possessive "'s") so e.g. "Jane Smith's Birthday"
-// displays as "Jane Smith" rather than repeating "Birthday" next to the
-// 🎂 section header that already says so.
 function classifyCalendarEvent(title) {
   const t = String(title || '');
   if (/\banniversary\b/i.test(t)) return 'anniversary';
@@ -885,57 +909,140 @@ function classifyCalendarEvent(title) {
   return 'holiday';
 }
 
-function cleanEventName(title, keyword) {
-  return String(title || '')
-    .replace(new RegExp("[’']s\\s*" + keyword + "\\b", 'i'), '')
-    .replace(new RegExp('\\b' + keyword + '\\b', 'i'), '')
-    .replace(/[-–—:]+$/, '')
-    .trim();
+// Sage titles are consistently "<Name> - <Category>" (e.g. "Jane Smith -
+// Birthday", "Jane Smith - Employment anniversary", "Jane Smith - TOIL,
+// Full day"); company-wide bank holidays ("Christmas Day") have no " - " at
+// all and come back unchanged. Splitting on the first " - " is far more
+// reliable than stripping category keywords, since categories vary freely
+// and a few multi-part-day summaries have a known Sage-side glitch where the
+// text repeats itself after the category — that repeat lands after the
+// split point either way, so it's discarded along with the category.
+function sageEventName(summary) {
+  const idx = summary.indexOf(' - ');
+  return (idx === -1 ? summary : summary.substring(0, idx)).trim();
 }
 
-// This week's (Mon–Fri) events from the shared calendar, cached 5 min — same
-// pattern as getSocialEvents. Uses the script's own Calendar access, not a
-// per-user token, since it's a shared read-only view for everyone.
+function unfoldIcsLines(text) {
+  // RFC5545 line folding: a continuation line starts with a single space or
+  // tab and should be joined to the previous line before parsing anything.
+  return String(text || '').replace(/\r\n[ \t]/g, '').replace(/\n[ \t]/g, '');
+}
+
+function unescapeIcsText(s) {
+  return String(s || '')
+    .replace(/\\n/gi, ' ')
+    .replace(/\\,/g, ',')
+    .replace(/\\;/g, ';')
+    .replace(/\\\\/g, '\\');
+}
+
+// value is either 'YYYYMMDD' (all-day) or 'YYYYMMDDTHHMMSS' (timed, always
+// local Europe/London time in this feed — no UTC/Z-suffixed values appear on
+// real VEVENTs, only on DTSTAMP, which this doesn't parse).
+function parseIcsDateValue(value, isAllDay) {
+  const y = Number(value.substr(0, 4));
+  const mo = Number(value.substr(4, 2)) - 1;
+  const d = Number(value.substr(6, 2));
+  if (isAllDay) return new Date(y, mo, d);
+  return new Date(y, mo, d, Number(value.substr(9, 2) || 0), Number(value.substr(11, 2) || 0), Number(value.substr(13, 2) || 0));
+}
+
+// Fetches the whole Sage feed and replaces SageEvents in one go. Intended to
+// run weekly via a trigger, not per-request. Parses fully into `rows` before
+// touching the sheet, so a failed fetch or a feed that suddenly parses to
+// nothing leaves the existing (still-useful) sheet data untouched rather
+// than wiping it.
+function refreshHolidaysFromSage() {
+  const res = UrlFetchApp.fetch(getSageIcsUrl(), { muteHttpExceptions: true });
+  if (res.getResponseCode() !== 200) return;
+
+  const text = unfoldIcsLines(res.getContentText());
+  const blocks = text.split('BEGIN:VEVENT').slice(1);
+  const rows = [];
+
+  blocks.forEach(function (block) {
+    const dtstartMatch = block.match(/DTSTART(;[^:\r\n]*)?:([^\r\n]+)/);
+    const dtendMatch = block.match(/DTEND(;[^:\r\n]*)?:([^\r\n]+)/);
+    const summaryMatch = block.match(/SUMMARY:([^\r\n]+)/);
+    if (!dtstartMatch || !summaryMatch) return;
+
+    const isAllDay = /VALUE=DATE/.test(dtstartMatch[1] || '');
+    const start = parseIcsDateValue(dtstartMatch[2].trim(), isAllDay);
+    let end = dtendMatch ? parseIcsDateValue(dtendMatch[2].trim(), isAllDay) : start;
+    // All-day DTEND is exclusive (the day after the last day off) — pull back
+    // one day so "end" means the last actual day, matching the date-range
+    // convention used everywhere else in this file.
+    if (isAllDay) end = new Date(end.getFullYear(), end.getMonth(), end.getDate() - 1);
+
+    const summary = unescapeIcsText(summaryMatch[1].trim());
+    rows.push([
+      sageEventName(summary),
+      classifyCalendarEvent(summary),
+      Utilities.formatDate(start, 'Europe/London', 'yyyy-MM-dd'),
+      Utilities.formatDate(end, 'Europe/London', 'yyyy-MM-dd')
+    ]);
+  });
+
+  if (!rows.length) return; // parsed nothing — likely a bad fetch, don't wipe good data
+
+  const sheet = getSheet('SageEvents');
+  const lastRow = sheet.getLastRow();
+  if (lastRow > 1) sheet.getRange(2, 1, lastRow - 1, 4).clearContent();
+  sheet.getRange(2, 1, rows.length, 4).setValues(rows);
+}
+
+// One-time setup — run this once from the Apps Script editor (pick it in the
+// function dropdown, click Run) to install the weekly refresh. Safe to
+// re-run: it removes any existing trigger for this function first, so
+// running it again (e.g. to change the day/time below) never leaves
+// duplicates.
+function installSageWeeklyTrigger() {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'refreshHolidaysFromSage') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('refreshHolidaysFromSage')
+    .timeBased()
+    .onWeekDay(ScriptApp.WeekDay.MONDAY)
+    .atHour(3)
+    .create();
+}
+
+// This week's (Mon–Fri) events, read from the SageEvents sheet (populated
+// weekly by refreshHolidaysFromSage — this function never touches Sage
+// directly). Cached 5 min purely so concurrent requests in the same window
+// share one sheet read; the underlying data itself only changes weekly.
 function getHolidaysThisWeek() {
   const now = new Date();
   const day = now.getDay(); // 0=Sun..6=Sat
   const monday = new Date(now.getFullYear(), now.getMonth(), now.getDate() + (day === 0 ? -6 : 1 - day));
-  const cacheKey = 'hol_' + Utilities.formatDate(monday, 'Europe/London', 'yyyy-MM-dd');
+  const mondayStr_ = Utilities.formatDate(monday, 'Europe/London', 'yyyy-MM-dd');
+  const cacheKey = 'hol_' + mondayStr_;
 
   const cached = CACHE.get(cacheKey);
   if (cached) return JSON.parse(cached);
 
   const friday = new Date(monday);
   friday.setDate(friday.getDate() + 4);
-  const rangeEnd = new Date(friday);
-  rangeEnd.setDate(rangeEnd.getDate() + 1); // getEvents' end bound is exclusive
+  const fridayStr = Utilities.formatDate(friday, 'Europe/London', 'yyyy-MM-dd');
 
   const holidays = [];
   const birthdays = [];
   const anniversaries = [];
   try {
-    const cal = CalendarApp.getCalendarById(HOLIDAYS_CALENDAR_ID);
-    const events = cal ? cal.getEvents(monday, rangeEnd) : [];
-    events.forEach(function (ev) {
-      const isAllDay = ev.isAllDayEvent();
-      const start = isAllDay ? ev.getAllDayStartDate() : ev.getStartTime();
-      let end = isAllDay ? ev.getAllDayEndDate() : ev.getEndTime();
-      // All-day end dates from the Calendar service are exclusive (the day AFTER
-      // the last day off) — pull back one day so "end" means their last day away.
-      if (isAllDay) end = new Date(end.getFullYear(), end.getMonth(), end.getDate() - 1);
+    const values = getSheet('SageEvents').getDataRange().getValues();
+    for (let i = 1; i < values.length; i++) {
+      const name = values[i][0];
+      const kind = values[i][1];
+      if (!name) continue;
+      const start = parseRowDate(values[i][2]);
+      const end = parseRowDate(values[i][3]);
+      if (start > fridayStr || end < mondayStr_) continue; // no overlap with this week
 
-      const title = ev.getTitle();
-      const kind = classifyCalendarEvent(title);
-      const entry = {
-        name: kind === 'holiday' ? title : cleanEventName(title, kind),
-        start: Utilities.formatDate(start, 'Europe/London', 'yyyy-MM-dd'),
-        end: Utilities.formatDate(end, 'Europe/London', 'yyyy-MM-dd')
-      };
-
+      const entry = { name, start, end };
       if (kind === 'birthday') birthdays.push(entry);
       else if (kind === 'anniversary') anniversaries.push(entry);
       else holidays.push(entry);
-    });
+    }
   } catch (e) {}
 
   const result = { holidays, birthdays, anniversaries };

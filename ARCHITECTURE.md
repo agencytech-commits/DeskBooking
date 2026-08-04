@@ -160,6 +160,7 @@ yet merged — see §10.
 | `CLIENT_SECRET` | **hardcoded in `tce-oauth-worker.js`**, and also still present in dead `worker.js` | 🔴 leaked — see §10 |
 | `APPS_SCRIPT_URL` | hardcoded in `tce-oauth-worker.js` | fixed `/exec` URL, doesn't change on Apps Script redeploys (see §8) |
 | Session signing key | **doesn't exist yet** — cookies are unsigned | pending, see §10 |
+| Sage HR feed URL | Apps Script **Script Property** `SAGE_ICS_URL` | correctly kept out of source from the start — see §8 |
 
 The pending security branch (`security/session-signing-and-secret-rotation`,
 not yet merged) moves `CLIENT_SECRET` to a `GOOGLE_CLIENT_SECRET` Worker secret
@@ -290,18 +291,48 @@ Glass Box fill in a moment later.
 
 The header widget calls `getHolidays` (no params), which returns
 `{ success, holidays, birthdays, anniversaries }` — each an array of
-`{ name, start, end }` — from `getHolidaysThisWeek()`. All three come from
-**one shared calendar** (`HOLIDAYS_CALENDAR_ID`); there's no separate
-calendar per category, so `code.gs`'s `classifyCalendarEvent()` buckets each
-event purely by a keyword in its title (`anniversary` → anniversaries,
-`birthday` → birthdays, anything else → a real absence), and
-`cleanEventName()` strips that keyword (plus a leading possessive `'s`) so
-"Jane Smith's Birthday" displays as just "Jane Smith" under the "🎂 Birthdays
-this week" heading rather than repeating itself. **This is keyword matching
-against whatever's typed into that calendar's event titles** — if someone
-titles an event unconventionally (no "Birthday"/"Anniversary" in the title,
-or a typo), it silently falls into the "Away this week" bucket instead.
-There's no calendar-side field or color being read, only the title string.
+`{ name, start, end }` — from `getHolidaysThisWeek()`.
+
+**Data source: Sage HR, not Google Calendar.** All three categories come from
+one Sage HR calendar-sync feed (a plain iCal/.ics URL — see Sage HR's
+Settings > Calendar sync). That URL is a bearer secret — anyone who has it
+can read the whole company's leave/birthday/anniversary data with no further
+auth — so it's a **Script Property**, not a hardcoded constant:
+`getSageIcsUrl()` reads it from `PropertiesService.getScriptProperties()`.
+Set it once via the Apps Script editor's **Project Settings (gear icon) >
+Script Properties > Add script property**, key `SAGE_ICS_URL`. This is the
+Apps Script equivalent of a Cloudflare Worker secret — it lives outside the
+script's source, so it's never in this repo or visible to anyone reading the
+code. There's no separate feed per category,
+so `code.gs`'s `classifyCalendarEvent()` buckets each event purely by a
+keyword in its title (`anniversary` → anniversaries, `birthday` → birthdays,
+anything else → a real absence). Sage's own titles are consistently `<Name> -
+<Category>` (e.g. "Jane Smith - Birthday", "Jane Smith - Employment
+anniversary"), so `sageEventName()` extracts the display name by splitting on
+the first `" - "` rather than stripping keywords — company-wide bank holidays
+("Christmas Day") have no `" - "` and pass through unchanged, landing in the
+"Away this week" bucket (a company holiday, not a real absence — a known
+quirk, not fixed). **This is keyword matching against whatever Sage puts in
+the title** — if that wording ever changes, events would silently land in
+the wrong bucket with no error.
+
+**Fetching from Sage never happens on a page load.** `getHolidaysThisWeek()`
+only reads the `SageEvents` sheet tab — a local snapshot, refreshed weekly by
+`refreshHolidaysFromSage()` via a time-driven trigger (installed once by
+running `installSageWeeklyTrigger()` from the Apps Script editor — this is
+a separate one-time setup step from the deployment itself; re-running it is
+safe, it clears any existing trigger for the same function first). This
+decouples app responsiveness from Sage's availability entirely: if Sage is
+slow, down, or the feed format changes enough to break parsing, the app just
+keeps serving last week's snapshot rather than failing live requests. A
+failed or empty fetch also leaves the existing sheet data untouched rather
+than wiping it — `refreshHolidaysFromSage()` parses fully into memory before
+writing anything.
+
+The iCal parsing here is hand-rolled (regex-based VEVENT extraction +
+RFC5545 line-unfolding), not a library — Apps Script has no built-in ICS
+parser. It only reads `DTSTART`/`DTEND`/`SUMMARY` per event; anything else in
+the feed (`DESCRIPTION`, `UID`, the `VTIMEZONE` block) is ignored.
 
 All three lists are scoped to the current calendar week (Mon–Fri), not the
 currently-viewed booking week. The frontend filters each to `end >= today`
@@ -381,6 +412,8 @@ merge → deploy → verify.
 ## 11. Quick reference for common changes
 
 - **Add/remove an admin:** edit the `Admins` sheet tab directly (one email per row).
+- **Force a Sage refresh outside the weekly schedule:** run `refreshHolidaysFromSage()` once from the Apps Script editor's function dropdown.
+- **Sage feed URL changed** (e.g. regenerated in Sage HR settings): update the `SAGE_ICS_URL` Script Property (Project Settings > Script Properties) — no code change or redeploy needed, since `getSageIcsUrl()` reads it at call time.
 - **Change desk count:** `TOTAL_CORE_DESKS` const in `code.gs`.
 - **Change office hours (Glass Box grid):** `OFFICE_START_HOUR`/`OFFICE_END_HOUR`
   in `code.gs`, and `GLASS_HOURS` generation in `app.html`.
@@ -413,5 +446,5 @@ project / domain / spreadsheet" scan:
 | Spreadsheet ID | `code.gs` (`SHEET_ID`) |
 | Glass Box resource calendar ID | `code.gs` (`GLASS_BOX_CALENDAR`) |
 | Social calendar ID | `code.gs` (`SOCIAL_CALENDAR_ID`) |
-| Holidays calendar ID | `code.gs` (`HOLIDAYS_CALENDAR_ID`) |
+| Sage HR calendar-sync feed URL | **not hardcoded** — Script Property `SAGE_ICS_URL`, read via `getSageIcsUrl()` |
 | `deskbooking`/`tce-oauth` hostnames | scattered across `tce-oauth-worker.js`, `signin.html`, `app.html` — see §5's table for exactly which path uses which |

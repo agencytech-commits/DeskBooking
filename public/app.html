@@ -1310,7 +1310,16 @@ Promise.all([
   loadMonthSummary(),
   loadHolidays()
 ]).finally(hideAppLoader);
-setTimeout(hideAppLoader, 12000);        // safety backstop — never trap the user
+// Safety backstop — never trap the user. Bumped from 12s: now that
+// api()/apiPost() are strictly serialized (see the concurrency note above
+// api()), the initial load is 4 sequential Apps Script calls rather than
+// several attempted at once — measured ~8.5s warm-cache total, and a single
+// retry cycle on one of them (1.5-3s backoff) can push close to the old
+// 12s ceiling on a normal, successful load. 12s risked firing this backstop
+// *before* real data was ready, which would have reproduced the exact
+// "loading screen finishes but content still isn't there" bug this whole
+// change exists to fix.
+setTimeout(hideAppLoader, 20000);
 // Reveal the live-calendar embed even if its onload never fires.
 setTimeout(function(){ var s=document.getElementById('glassEmbedSkeleton'); if(s) s.remove(); }, 8000);
 </script>

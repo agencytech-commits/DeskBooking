@@ -25,7 +25,7 @@ is a Google Apps Script project — not a conventional backend.
 | App page | Static HTML/JS, the booking UI | Served as a static asset by the Worker | [public/app.html](public/app.html) |
 | Edge Worker | OAuth callback, session cookie, API proxy | Cloudflare Workers (see §3) | [tce-oauth-worker.js](tce-oauth-worker.js) |
 | Worker config | Asset binding, routing rules | Cloudflare | [wrangler.toml](wrangler.toml) |
-| Backend | All business logic, reads/writes the Sheet, calls Google Calendar/People APIs | Google Apps Script project bound to the Sheet | **not in this repo** — see §7 |
+| Backend | All business logic, reads/writes the Sheet, calls Google Calendar/People APIs | Google Apps Script project bound to the Sheet | [apps-script/code.gs](apps-script/code.gs) — **reference copy only**, see §8 |
 | Data store | Bookings, day notes, admin list | Google Sheet `1C1k-ZMmizDFf357fAQvKdKgjmgaP8V_zmGrie-KR0vI` | external |
 | Glass Box calendar | Room resource calendar | Google Calendar resource `c_1880lps1iqdbajhuggvb8tlc8i36g@resource.calendar.google.com` | external |
 | Social calendar | Read-only events shown in the UI | Google Calendar `c_41272cd44...@group.calendar.google.com` | external |
@@ -171,15 +171,23 @@ instantly.
 
 ## 8. The Apps Script backend (`code.gs`)
 
-**This file is not in this git repo.** It lives in the Apps Script project bound
-to the Google Sheet, edited directly in the Apps Script web editor
-(script.google.com), and is the actual system of record for what "the backend"
-does. Treat a copy of its source pasted into a conversation or ticket as a
-snapshot, not a source of truth — the live one can drift from any copy.
+[apps-script/code.gs](apps-script/code.gs) in this repo is a **reference copy
+only, kept for version control and diffing.** The actual system of record is
+whatever is currently pasted into the Apps Script web editor
+(script.google.com) for the project bound to the Sheet — that live editor
+content is what Apps Script actually runs (once deployed, see below), and it
+can silently drift from this repo copy if someone edits it directly in the
+browser and forgets to also update this file (or vice versa: updating this
+file does nothing to the live script by itself). Treat any mismatch between
+this file and a fresh paste from the editor as the editor winning — this file
+is the one that can be stale.
 
-**Deploying it is a separate, manual step from deploying the Worker/frontend.**
-Saving code in the Apps Script editor does **not** update the live `/exec`
-endpoint. To publish a change:
+**Committing to this repo does not deploy anything.** Deploying is a separate,
+manual step, entirely disconnected from git and from the Cloudflare Workers
+Build pipeline that deploys the Worker/frontend on every push. Saving code in
+the Apps Script editor doesn't update the live `/exec` endpoint either — that
+needs its own explicit action. To publish a change (whether it originated here
+or was edited directly in the browser):
 
 1. Apps Script editor → **Deploy → Manage deployments**.
 2. Find the deployment whose Web App URL matches `APPS_SCRIPT_URL` in

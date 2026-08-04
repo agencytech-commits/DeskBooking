@@ -202,6 +202,14 @@ export default {
       return Response.redirect('https://deskbooking.agencytech.workers.dev/signin.html', 302);
     }
 
+    // ── SIGN IN (clean URL) ──────────────────────────────────
+    // html_handling is "none" (see wrangler.toml) so the asset server won't
+    // auto-map /signin -> signin.html itself; with no matching asset the
+    // request falls through to the Worker, which needs its own route for it.
+    if (url.pathname === '/signin') {
+      return Response.redirect('https://deskbooking.agencytech.workers.dev/signin.html', 302);
+    }
+
     // ── NOT FOUND ────────────────────────────────────────────
     // Never `fetch(request)` here: this Worker owns its own hostname, so
     // re-fetching the inbound URL just re-enters this same Worker and spins

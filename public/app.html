@@ -560,10 +560,14 @@ function renderHolidays() {
   if (!items.length) { container.innerHTML = ''; return; }
 
   container.innerHTML = '<div class="holidays-title">Away this week</div>' + items.map(h => {
+    const startD = new Date(h.start + 'T00:00:00');
     const endD = new Date(h.end + 'T00:00:00');
+    const endLabel = `${DAY_SHORT[endD.getDay()]} ${ordinal(endD.getDate())}`;
     const label = h.end === todayS
       ? 'away today'
-      : `away til ${DAY_SHORT[endD.getDay()]} ${ordinal(endD.getDate())}`;
+      : h.start === todayS
+        ? `away til ${endLabel}`
+        : `away ${DAY_SHORT[startD.getDay()]} ${ordinal(startD.getDate())} til ${endLabel}`;
     return `<div class="holiday-item"><span class="holiday-name">${escapeHtml(h.name)}</span><span class="holiday-until">(${label})</span></div>`;
   }).join('');
 }

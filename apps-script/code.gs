@@ -112,6 +112,32 @@ function doGet(e) {
         const cal = getHolidaysThisWeek();
         return jsonResponse({ success: true, holidays: cal.holidays, birthdays: cal.birthdays, anniversaries: cal.anniversaries });
       }
+      case 'getInitialLoad': {
+        // Bundles getAll + getGlassBox + getMonthSummary + getHolidays into
+        // one execution/round-trip, used only for the app's first render.
+        // Measured directly: Apps Script's exec endpoint has real per-request
+        // latency/reliability variance (redirect + execution overhead)
+        // independent of what the script actually does internally — four
+        // separate requests means four independent chances to hit a slow or
+        // failing one. One request has one. The individual actions above stay
+        // unchanged and are still used for ongoing week/month navigation,
+        // where calls are naturally spread out rather than fired in a burst.
+        const weekResult = getAllData(e.parameter.weekStart, user);
+        const glass = getGlassBoxWeek(e.parameter.weekStart, user);
+        const month = getMonthSummary(e.parameter.monthStart, user);
+        const cal = getHolidaysThisWeek();
+        return jsonResponse({
+          success: true,
+          days: weekResult.days,
+          prefs: weekResult.prefs,
+          socialEvents: weekResult.socialEvents,
+          glassBox: glass.glassBox,
+          monthSummaryDays: month.days,
+          holidays: cal.holidays,
+          birthdays: cal.birthdays,
+          anniversaries: cal.anniversaries
+        });
+      }
       default:
         return jsonResponse({ error: 'Unknown action: ' + action });
     }

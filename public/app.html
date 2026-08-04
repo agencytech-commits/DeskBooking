@@ -1290,6 +1290,64 @@ async function goToMonthDay(ds) {
 }
 renderHeaderDateTime();
 setInterval(renderHeaderDateTime, 1000);
+// ── INITIAL LOAD (one consolidated request, first render only) ─────────
+// Replaces separately awaiting refresh()+loadMonthSummary()+loadHolidays()
+// with a single getInitialLoad call — see the comment on that action in
+// code.gs for why. Manually populates exactly the same caches and calls the
+// same render functions those three would have, so this is purely a
+// round-trip-count optimization, not a behavior change.
+async function loadInitial(attempt) {
+  attempt = attempt || 0;
+  const ws = dateStr(currentWeekStart);
+  const now = new Date();
+  const monthKey = now.getFullYear() + '-' + now.getMonth();
+  const monthStart = dateStr(new Date(now.getFullYear(), now.getMonth(), 1));
+  updateNavButtons();
+
+  if (attempt === 0) {
+    document.getElementById('weekGrid').innerHTML = '<div class="loading">Loading…</div>';
+    document.getElementById('glassGrid').innerHTML = '<div class="glass-loading">Loading calendar…</div>';
+    // Instant paint the month calendar from localStorage while the request is in flight.
+    try {
+      const saved = localStorage.getItem('tce_month_' + monthKey);
+      if (saved) monthCache = { year: now.getFullYear(), month: now.getMonth(), days: JSON.parse(saved) };
+    } catch(e) {}
+    renderMonthCalendar();
+  }
+
+  const result = await api({ action: 'getInitialLoad', weekStart: ws, monthStart });
+
+  if (!result || result.error) {
+    if (attempt < 2) {
+      setTimeout(() => loadInitial(attempt + 1), 1500 * (attempt + 1));
+      return;
+    }
+    // getInitialLoad failed after retries — fall back to the original four
+    // separate, independently-proven calls rather than leaving the user
+    // with nothing.
+    await Promise.all([refresh(true), loadMonthSummary(), loadHolidays()]);
+    return;
+  }
+
+  if (result.prefs) renderUser(result.prefs);
+  cacheWeekResult(ws, result);
+  renderWeekFromCache(ws);
+
+  glassCache[ws] = result.glassBox || {};
+  if (dateStr(currentWeekStart) === ws) renderGlassFromCache(ws);
+
+  monthCache = { year: now.getFullYear(), month: now.getMonth(), days: result.monthSummaryDays || {} };
+  renderMonthCalendar();
+  try { localStorage.setItem('tce_month_' + monthKey, JSON.stringify(result.monthSummaryDays || {})); } catch(e) {}
+
+  holidaysCache = result.holidays || [];
+  birthdaysCache = result.birthdays || [];
+  anniversariesCache = result.anniversaries || [];
+  renderHolidays();
+
+  schedulePrefetch();
+}
+
 // ── LOADING SCREEN (hide once first data render completes) ─────
 const LOADER_MIN_MS = 1900;              // let the logo land before fading
 const loaderShownAt = Date.now();
@@ -1303,13 +1361,10 @@ function hideAppLoader() {
   setTimeout(() => el.classList.add("is-hidden"), wait);
 }
 
-// First load only: wait for desks, Glass Box, month calendar AND holidays to all be
-// ready before revealing the page, so nothing pops in after the loader animation ends.
-Promise.all([
-  refresh(true),
-  loadMonthSummary(),
-  loadHolidays()
-]).finally(hideAppLoader);
+// First load only: one consolidated request for desks, Glass Box, month
+// calendar and holidays together, rather than four separate ones — see
+// loadInitial() above api(), and the getInitialLoad case in code.gs.
+loadInitial().finally(hideAppLoader);
 // Safety backstop — never trap the user. Bumped from 12s: now that
 // api()/apiPost() are strictly serialized (see the concurrency note above
 // api()), the initial load is 4 sequential Apps Script calls rather than

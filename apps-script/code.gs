@@ -1125,6 +1125,17 @@ function refreshHolidaysFromSage() {
 
     const startStr = Utilities.formatDate(start, 'Europe/London', 'yyyy-MM-dd');
     const endStr = Utilities.formatDate(end, 'Europe/London', 'yyyy-MM-dd');
+    // An end date before its own start date is never legitimate under any
+    // interpretation — seen in practice from at least one real Sage entry,
+    // most likely the same class of feed irregularity already noted in
+    // sageEventName()'s comment (a known Sage-side glitch on some multi-day
+    // entries). Rather than guess at a reconstruction, drop the row: a
+    // missing "away" entry is a much smaller problem than showing the whole
+    // office an impossible, confusing date range.
+    if (endStr < startStr) {
+      console.log('Skipping SageEvents row with end before start: ' + JSON.stringify({ summary: summaryMatch[1].trim(), startStr, endStr }));
+      return;
+    }
     if (startStr > windowEndStr || endStr < windowStartStr) return; // outside the window we care about
 
     const summary = unescapeIcsText(summaryMatch[1].trim());
@@ -1184,6 +1195,12 @@ function getHolidaysThisWeek() {
       if (!name) continue;
       const start = parseRowDate(values[i][2]);
       const end = parseRowDate(values[i][3]);
+      // Belt-and-suspenders alongside the same check in refreshHolidaysFromSage():
+      // an end-before-start row should never be written going forward, but this
+      // also filters out any already-corrupted row already sitting in the sheet
+      // from before that guard existed, without waiting for the next weekly
+      // refresh to overwrite it.
+      if (end < start) continue;
       if (start > fridayStr || end < mondayStr_) continue; // no overlap with this week
 
       const entry = { name, start, end };

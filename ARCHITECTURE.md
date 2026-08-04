@@ -539,6 +539,19 @@ quirk, not fixed). **This is keyword matching against whatever Sage puts in
 the title** — if that wording ever changes, events would silently land in
 the wrong bucket with no error.
 
+**Occasionally Sage's feed produces an end date before its start date**
+(observed live 2026-08-04: an "away" entry showing a start/end pair whose
+weekday labels didn't even match real calendar dates, with the end before
+the start). The precise malformed input wasn't confirmed directly against
+the live feed, but it's reproducible via a malformed all-day `DTEND` equal to
+its own `DTSTART` — the exclusive-end-date adjustment a few lines up (`end =
+... - 1`) then pushes the end to one day *before* the start. Both
+`refreshHolidaysFromSage()` (on write) and `getHolidaysThisWeek()` (on read,
+so an already-corrupted row self-heals without waiting for the next weekly
+refresh) now drop any row where `end < start` rather than display a
+nonsensical range — a missing "away" entry is a much smaller problem than an
+impossible one shown to the whole office.
+
 **Fetching from Sage never happens on a page load.** `getHolidaysThisWeek()`
 only reads the `SageEvents` sheet tab — a local snapshot, refreshed weekly by
 `refreshHolidaysFromSage()` via a time-driven trigger (installed once by

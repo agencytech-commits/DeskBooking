@@ -95,6 +95,52 @@ run_worker_first = ["/", "/api", "/app", "/callback", "/signout"]
   asset server treats a file literally named `index.html` as the implicit
   document for `/` and won't serve it at its own path — see §9.
 
+### Static asset payload and browser caching (investigated 2026-08-04)
+
+`app.html` is a single monolithic file — HTML, CSS, and JS all inline, plus two
+branding images embedded as data URIs (no separate `.css`/`.js`/image files
+exist to point a CDN cache or long-lived `Cache-Control` at). Two things found
+while chasing load-time complaints:
+
+1. **The two embedded logos were far larger than their display size needed.**
+   Both were the same 1042×1042 PNG (~18KB each) — one shown at 64×64 CSS px
+   in the header (`.logo-box`), the other at up to 460 CSS px in the loading
+   splash. The header one was re-encoded down to 128×128 WebP (~2.3KB); the
+   splash one was kept at its original resolution (it's genuinely displayed
+   large enough to need it) but re-encoded from PNG to WebP at quality 92
+   (~9.4KB, down from ~18KB, same pixels). Combined, this cut `app.html`'s raw
+   size by ~26% and its Brotli-compressed size by ~44% (measured: ~49KB → an
+   estimated ~27KB). WebP is safe here — every browser capable of signing in
+   via Google OAuth supports it.
+2. **The live response has no `ETag`/`Last-Modified`, only
+   `Cache-Control: public, max-age=0, must-revalidate`.** `max-age=0` alone
+   would be fine if paired with a validator (the browser would send a
+   conditional request and usually get a cheap 304), but with no validator at
+   all the browser has nothing to send — every navigation re-downloads the
+   full file from scratch, even a same-day repeat visit. This is Cloudflare's
+   default for this asset configuration, not something set explicitly in this
+   repo. **Not fixed as part of this pass** — fixing it properly means routing
+   `/app.html` through the Worker (via `env.ASSETS.fetch()` + rewriting
+   response headers, adding a real `ETag`) rather than serving it purely
+   asset-first, which changes routing behaviour that has already caused an
+   outage once before (§9) and deserves its own careful test pass rather than
+   a drive-by change alongside unrelated fixes.
+
+**Not done, and deliberately left as options rather than changes:**
+- Splitting `getGlassBoxWeek`'s Calendar API call back out of `getInitialLoad`
+  (it was folded in for round-trip-count reasons — see the concurrency
+  section below) — the `GLASS_TTL` bump above addresses the same risk more
+  cheaply, so this is only worth revisiting if staleness/latency on `gb_`
+  turns out to still be a problem in practice.
+- Edge-caching cacheable `GET /api` actions (`getHolidays`, `getMonthSummary`,
+  etc.) at Cloudflare using the Worker's `caches.default`, so a repeat page
+  load within the TTL window is served from Cloudflare's edge without ever
+  reaching Apps Script at all. This would also reduce concurrent-request
+  pressure on Apps Script (see the concurrency limit below), which is the
+  more fundamental bottleneck — but it's a genuine architecture change (cache
+  key design, keeping it in sync with the per-user fields already in some of
+  these responses) rather than a safe drive-by edit.
+
 ## 5. Request routing reference
 
 All hardcoded hostnames as they appear in the code today:
@@ -302,19 +348,26 @@ against:
 
 | Cache key prefix | What | TTL | Invalidated by |
 |---|---|---|---|
-| `wk_<mondayOfWeek>` | a week's desk bookings + notes | 90s | any booking write for that week |
-| `gb_<mondayOfWeek>` | a week's Glass Box events | 45s | Glass Box book/cancel |
+| `wk_<mondayOfWeek>` | a week's desk bookings + notes | 300s | any booking write for that week |
+| `gb_<mondayOfWeek>` | a week's Glass Box events | 300s | Glass Box book/cancel |
 | `ms_<email>_<year-month>` | a user's month summary | 120s | that user's own booking write in that month |
 | `soc_<mondayOfWeek>` | social calendar events | 300s | never (rarely changes) |
 | `admins` | the admin email list | 600s | never (changes almost never) |
 
 TTLs are a backstop, not the primary freshness mechanism — writes explicitly
 invalidate the relevant key so the *actor's own* change is visible immediately;
-other users may see a stale cache for up to the TTL.
+other users may see a stale cache for up to the TTL. `wk_`/`gb_` were bumped
+from their original 90s/45s to 300s (2026-08-04) specifically so
+`warmSharedCaches()`'s 5-minute trigger keeps them continuously warm between
+runs instead of expiring and sitting cold for most of each interval — at the
+old TTLs, `gb_` in particular (backed by a live Google Calendar API call, not
+just a sheet read) was cold ~85% of the time, and since `getInitialLoad`
+folds it into the same execution as everything else, a cold miss there
+delayed the *entire* first render, not just the Glass Box grid.
 
 **This sharing only helps within the TTL window, not across idle periods.**
 `CacheService` caps out at 6 hours even if asked for longer, and every TTL
-above is far shorter than that (45s–600s) — so after the app sits unused for
+above is far shorter than that (120s–600s) — so after the app sits unused for
 hours or days, all of these are guaranteed cold, and whoever loads it next
 pays the full cost in one request (multiple sheet reads + the Glass Box
 Calendar API + `getSocialEvents`'s slow `CalendarApp` call). `warmSharedCaches()`

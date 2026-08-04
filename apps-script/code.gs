@@ -45,9 +45,22 @@ const OFFICE_END_HOUR = 19;
 // ============================================================
 
 const CACHE = CacheService.getScriptCache();
-const WEEK_TTL = 90;    // bookings — short; invalidated immediately on write
+// WEEK_TTL/GLASS_TTL match the 5-minute warmSharedCaches() trigger interval
+// (see below) rather than being short-and-punchy: a write already invalidates
+// its own key immediately regardless of TTL, so a longer backstop costs
+// nothing for the actor's own freshness and only affects how stale *other*
+// users' view could get before it's force-refreshed. The payoff is that
+// warmSharedCaches() actually keeps these continuously warm between its own
+// runs — at the old 45s/90s TTLs each one expired and sat cold for most of
+// every 5-minute window (e.g. GLASS_TTL=45 was warm for 45s, cold for the
+// remaining ~4m15s), which mattered most for GLASS_TTL specifically since a
+// cold gb_ miss means a live UrlFetchApp call to the Google Calendar API —
+// now folded into getInitialLoad's single execution (see doGet), so a cold
+// miss there no longer just delays the Glass Box grid, it delays the whole
+// first render.
+const WEEK_TTL = 300;   // bookings — invalidated immediately on write
 const SOCIAL_TTL = 300; // social calendar — changes rarely
-const GLASS_TTL = 45;   // glass box — invalidated on book/cancel
+const GLASS_TTL = 300;  // glass box — invalidated on book/cancel
 const ADMIN_TTL = 600;  // admin list — changes almost never
 
 // Memoized per-execution spreadsheet handle so getSheet() doesn't re-open the
@@ -369,7 +382,7 @@ function getNotesForRange(startDate, endDate) {
 
 function getWeekData(weekStart) {
   // Identical for every user → cache it. Booking writes call invalidateWeek() so
-  // a just-booked desk shows up immediately; the 90s TTL is only a safety backstop.
+  // a just-booked desk shows up immediately; the TTL is only a safety backstop.
   const cacheKey = 'wk_' + mondayStr(weekStart);
   const cached = CACHE.get(cacheKey);
   if (cached) return JSON.parse(cached);
@@ -1094,9 +1107,10 @@ function getHolidaysThisWeek() {
 // CACHE WARMING
 // ------------------------------------------------------------
 // The shared CacheService entries above (wk_/gb_/soc_/hol_/admins) have
-// short TTLs (45s-600s) by design — they exist to coalesce near-simultaneous
-// requests, not to survive idle periods, and CacheService caps out at 6
-// hours even if asked for longer. Left alone, anyone loading the app after
+// short TTLs (300s-600s) by design — they exist to coalesce near-simultaneous
+// requests and to stay continuously warm between warmSharedCaches() runs
+// (see WEEK_TTL/GLASS_TTL's comment above), not to survive idle periods, and
+// CacheService caps out at 6 hours even if asked for longer. Left alone, anyone loading the app after
 // it's sat idle for hours/days hits every one of these fully cold and pays
 // the full cost on that one request: two sheet reads, one Glass Box Calendar
 // API call, and one CalendarApp call for social events (CalendarApp is

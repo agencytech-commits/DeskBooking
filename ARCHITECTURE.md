@@ -432,18 +432,36 @@ above is far shorter than that (120s–600s) — so after the app sits unused fo
 hours or days, all of these are guaranteed cold, and whoever loads it next
 pays the full cost in one request (multiple sheet reads + the Glass Box
 Calendar API + `getSocialEvents`'s slow `CalendarApp` call). `warmSharedCaches()`
-exists specifically to prevent this: a trigger re-populates the current
-week's `wk_`/`gb_`/`soc_`/`hol_` and the `admins` cache every 5 minutes (see
-§11 for the one-time setup step), so no one has to be "the first person of
-the day" who eats the cold-start cost. It deliberately only warms the
-*current* week, not the ±2-week window the frontend prefetches in the
-background — that prefetch is already non-blocking, so warming it wouldn't
-fix anything a user actually feels, and `getSocialEvents` is expensive enough
+exists specifically to prevent this: a trigger re-populates `wk_`/`gb_`/`soc_`
+for the current week *and* next week (`WARM_WEEK_OFFSETS`), plus `hol_` and
+`admins`, every 5 minutes (see §11 for the one-time setup step), so no one
+has to be "the first person of the day" who eats the cold-start cost. `ms_`
+(month summary) is per-user and isn't warmed — proactively warming it for
+"whoever logs in next" isn't meaningful, though it's a single cheap sheet
+read on its own, not the multi-API bottleneck the others are.
+
+Originally this only warmed the current week, not the ±2-week window the
+frontend prefetches in the background, on the theory that the prefetch is
+non-blocking so warming further out wouldn't fix anything a user actually
+feels. **Extended to also cover next week (2026-08-05)** after users kept
+reporting next-week navigation as slow — the prefetch for it was still
+paying the full uncached cost, whether triggered by the background prefetch
+racing to fill it in or by someone clicking there directly before it had.
+Deliberately capped at +1 week rather than matching the frontend's full
+±2-week window: `getSocialEvents`' `CalendarApp` call is expensive enough
 that multiplying it by 5 weeks every 5 minutes isn't worth the added Apps
-Script execution quota for no felt benefit. `ms_` (month summary) is
-per-user and isn't warmed — proactively warming it for "whoever logs in
-next" isn't meaningful, though it's a single cheap sheet read on its own,
-not the multi-API bottleneck the others are.
+Script execution quota for weeks most people aren't looking at yet.
+
+**Also discovered 2026-08-05: this trigger, and the bookings-archive one
+below, had never actually been installed on the live project** — the only
+trigger present was `refreshHolidaysFromSage`'s weekly one. Every `getAll`/
+`getGlassBox` call had been paying the full uncached cost since launch
+(observed 13–23s per call, well above the 1.4s–11s+ `/exec` routing latency
+this section originally attributed it to), and `Bookings` had never had a
+row archived out of it. Both installer functions were run from the Apps
+Script editor to fix this — see §11's quick-reference entries for the
+one-time setup steps, and don't assume either trigger exists on a fresh
+deploy without checking the Triggers panel directly.
 
 **Unverified interaction worth knowing about**: the concurrency limit
 described just below was measured between concurrent `doGet` web requests.

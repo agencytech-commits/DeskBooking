@@ -1230,29 +1230,51 @@ function getHolidaysThisWeek() {
 // the original 30s timeouts. Proactively refreshing on a schedule means no
 // one has to be "the first person of the day" who eats that cost.
 //
-// Scoped to the current week only, not the ±2-week window the frontend
-// prefetches in the background — that prefetch is already non-blocking, so
-// warming it wouldn't fix anything a user actually feels, and getSocialEvents
-// specifically is expensive enough that multiplying it by 5 weeks on every
-// warming run isn't worth the added Apps Script execution quota.
+// Originally scoped to the current week only, not the ±2-week window the
+// frontend prefetches in the background, on the theory that the prefetch is
+// non-blocking so warming it wouldn't fix anything a user actually feels.
+// That didn't hold up in practice (observed 2026-08-05): users navigating to
+// next week — either by clicking there directly, or landing before the
+// background prefetch for it has finished — do feel it, since that prefetch
+// still pays the full uncached cost (two sheet reads, a live Glass Box
+// Calendar API call, a live CalendarApp call) for whichever week isn't
+// warmed here. Extended to also cover next week (WARM_WEEK_OFFSETS below),
+// which doubles this run's cost — deliberately not the full ±2-week prefetch
+// window, since getSocialEvents' CalendarApp call is expensive enough that
+// multiplying it by 5 weeks every 5 minutes isn't worth the added Apps
+// Script execution quota for a week most people aren't looking at yet.
 // ============================================================
+
+// How many weeks ahead of the current one to keep warm, in addition to the
+// current week itself (0 = this week only, the original behavior). Each
+// extra offset adds a full getWeekData + getGlassBoxWeek + getSocialEvents
+// pass to every 5-minute run — raise with that quota cost in mind, and see
+// prefetchWeek()/schedulePrefetch() in app.html for how far ahead the
+// frontend itself prefetches (currently 2 weeks).
+const WARM_WEEK_OFFSETS = [0, 1];
 
 function warmSharedCaches() {
   const today = new Date();
   const day = today.getDay();
   const monday = new Date(today.getFullYear(), today.getMonth(), today.getDate() + (day === 0 ? -6 : 1 - day));
-  const weekEnd = new Date(monday);
-  weekEnd.setDate(weekEnd.getDate() + 4);
 
-  const weekStartStr = Utilities.formatDate(monday, Session.getScriptTimeZone(), 'yyyy-MM-dd');
-  const weekEndStr = Utilities.formatDate(weekEnd, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  WARM_WEEK_OFFSETS.forEach(function (weekOffset) {
+    const weekStart = new Date(monday);
+    weekStart.setDate(weekStart.getDate() + 7 * weekOffset);
+    const weekEnd = new Date(weekStart);
+    weekEnd.setDate(weekEnd.getDate() + 4);
 
-  // getGlassBoxWeek only uses user.access_token (to call the Calendar API as
-  // whoever's asking) — the trigger runs as the account that installed it,
-  // so ScriptApp.getOAuthToken() stands in for a real signed-in user's token.
-  try { getWeekData(weekStartStr); } catch (e) {}
-  try { getGlassBoxWeek(weekStartStr, { access_token: ScriptApp.getOAuthToken() }); } catch (e) {}
-  try { getSocialEvents(weekStartStr, weekEndStr); } catch (e) {}
+    const weekStartStr = Utilities.formatDate(weekStart, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    const weekEndStr = Utilities.formatDate(weekEnd, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+
+    // getGlassBoxWeek only uses user.access_token (to call the Calendar API as
+    // whoever's asking) — the trigger runs as the account that installed it,
+    // so ScriptApp.getOAuthToken() stands in for a real signed-in user's token.
+    try { getWeekData(weekStartStr); } catch (e) {}
+    try { getGlassBoxWeek(weekStartStr, { access_token: ScriptApp.getOAuthToken() }); } catch (e) {}
+    try { getSocialEvents(weekStartStr, weekEndStr); } catch (e) {}
+  });
+
   try { getHolidaysThisWeek(); } catch (e) {}
   try { isAdmin(''); } catch (e) {}
 }

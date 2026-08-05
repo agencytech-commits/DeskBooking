@@ -1370,6 +1370,21 @@ async function loadInitial(attempt) {
 
   schedulePrefetch();
 
+  // Reveal now — everything the user perceives as "the app has loaded" is
+  // already rendered above. getPersonal is small but always-live (never
+  // cached anywhere, unlike the shared call above), and there's no reason
+  // to keep the loading screen up for it: it only fills in "my desk"/admin
+  // highlighting on top of a page that's already fully visible. Previously
+  // this call was hidden behind `loadInitial()`'s `.finally(hideAppLoader)`
+  // below, which meant every load waited out getPersonal's full round trip
+  // (and whatever the client-side appsScriptQueue made it wait behind)
+  // before the loader ever faded, even though nothing on screen was
+  // waiting on it. hideAppLoader() is idempotent (see loaderHidden below),
+  // so this is safe to call early and independently of the `.finally` still
+  // attached to loadInitial() itself, which remains as the backstop for the
+  // retry-exhausted fallback path a few lines up.
+  hideAppLoader();
+
   // Personal fields land whenever this resolves, independent of the shared
   // render above — until it does, currentUser is still its empty default,
   // so "my desk"/admin-cancel highlighting in the just-rendered week grid
@@ -1403,19 +1418,17 @@ function hideAppLoader() {
   setTimeout(() => el.classList.add("is-hidden"), wait);
 }
 
-// First load only: one consolidated request for desks, Glass Box, month
-// calendar and holidays together, rather than four separate ones — see
-// loadInitial() above api(), and the getInitialLoad case in code.gs.
+// First load only: fires the shared+personal pair above — see loadInitial()
+// and the getInitialLoadShared/getPersonal cases in code.gs. The normal path
+// now hides the loader itself, right after the shared render, from inside
+// loadInitial() — see the comment there. This `.finally` only still matters
+// for the path where getInitialLoadShared fails all its retries and falls
+// back to the old refresh()/loadMonthSummary()/loadHolidays() trio, which
+// doesn't call hideAppLoader() on its own.
 loadInitial().finally(hideAppLoader);
-// Safety backstop — never trap the user. Bumped from 12s: now that
-// api()/apiPost() are strictly serialized (see the concurrency note above
-// api()), the initial load is 4 sequential Apps Script calls rather than
-// several attempted at once — measured ~8.5s warm-cache total, and a single
-// retry cycle on one of them (1.5-3s backoff) can push close to the old
-// 12s ceiling on a normal, successful load. 12s risked firing this backstop
-// *before* real data was ready, which would have reproduced the exact
-// "loading screen finishes but content still isn't there" bug this whole
-// change exists to fix.
+// Safety backstop — never trap the user if something above hangs instead of
+// rejecting cleanly (hideAppLoader() is idempotent, so this is a no-op on
+// the normal path, which now hides well before this fires).
 setTimeout(hideAppLoader, 20000);
 // Reveal the live-calendar embed even if its onload never fires.
 setTimeout(function(){ var s=document.getElementById('glassEmbedSkeleton'); if(s) s.remove(); }, 8000);

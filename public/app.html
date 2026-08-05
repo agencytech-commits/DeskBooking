@@ -464,8 +464,6 @@ function escapeHtml(s) { return String(s==null?'':s).replace(/[&<>"']/g, c => ({
 
 // ── HEADER DATE/TIME ───────────────────────────────────────────
 const DAY_NAMES = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
-const DAY_SHORT = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
-function ordinal(n) { const s=['th','st','nd','rd'], v=n%100; return n+(s[(v-20)%10]||s[v]||s[0]); }
 function renderHeaderDateTime() {
   const now = new Date();
   document.getElementById('headerDate').textContent = `${DAY_NAMES[now.getDay()]} ${now.getDate()} ${MONTHS[now.getMonth()]}`;
@@ -597,10 +595,17 @@ function renderHolidays() {
   if (!container) return;
   const todayS = dateStr(new Date());
 
+  // Numbered DD/MM/YYYY rather than a bare weekday+day-of-month: the latter
+  // has no month/year in it at all, so a long-running absence (e.g.
+  // maternity leave, running months beyond the current window) showed as
+  // something like "away Sun 5th til Fri 4th" — technically correct dates,
+  // just from different months, with nothing to indicate that and every
+  // appearance of an impossible/reversed range instead of a real one.
   function dayLabel(dateS) {
     if (dateS === todayS) return 'today';
     const d = new Date(dateS + 'T00:00:00');
-    return `${DAY_SHORT[d.getDay()]} ${ordinal(d.getDate())}`;
+    const pad = n => String(n).padStart(2, '0');
+    return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()}`;
   }
   function awayLabel(h) {
     if (h.end === todayS) return 'away today';
